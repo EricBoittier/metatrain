@@ -1,8 +1,6 @@
 import shutil
 import subprocess
 import warnings
-from urllib.parse import urlparse
-from urllib.request import urlretrieve
 
 import ase.io
 import pytest
@@ -12,12 +10,15 @@ from metatomic.torch import ModelOutput
 from metatrain.utils.data import read_systems
 from metatrain.utils.io import load_model
 from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
+from metatrain.utils.testing._utils import download_hf_checkpoint_or_skip
 
 from . import DATASET_WITH_FORCES_PATH
 
 
 STABLE_VERSIONS = ["1.0.2", "1.5.0"]
-HF_PATH = "https://huggingface.co/lab-cosmo/upet/resolve/main/models/pet-mad-{size}-v{version}.ckpt"
+HF_REPO_ID = "lab-cosmo/upet"
+HF_REVISION = "main"
+HF_FILENAME = "models/pet-mad-{size}-v{version}.ckpt"
 NUM_SYSTEMS = 5
 
 FINETUNING_OPTIONS = """
@@ -78,16 +79,28 @@ def _get_expected_output(size, version):
         raise ValueError(f"Unknown version: {version} and size: {size}")
 
 
+def _size_for_version(version: str) -> str:
+    if version == "1.0.2":
+        return "s"
+    if version == "1.5.0":
+        return "xs"
+    raise ValueError(f"Unknown version: {version}")
+
+
+def _download_pet_mad_checkpoint(version: str) -> str:
+    size = _size_for_version(version)
+    return download_hf_checkpoint_or_skip(
+        repo_id=HF_REPO_ID,
+        filename=HF_FILENAME.format(size=size, version=version),
+        revision=HF_REVISION,
+    )
+
+
 @pytest.mark.parametrize("version", STABLE_VERSIONS)
 def test_pet_mad_consistency(version, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    if version == "1.0.2":
-        size = "s"
-    elif version == "1.5.0":
-        size = "xs"
-    path = HF_PATH.format(size=size, version=version)
-    if urlparse(path).scheme:
-        path, _ = urlretrieve(path)
+    size = _size_for_version(version)
+    path = _download_pet_mad_checkpoint(version)
 
     with warnings.catch_warnings():
         warnings.simplefilter(
@@ -122,13 +135,7 @@ def test_pet_mad_consistency(version, monkeypatch, tmp_path):
 @pytest.mark.parametrize("version", STABLE_VERSIONS)
 def test_pet_mad_finetuning(version, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    if version == "1.0.2":
-        size = "s"
-    elif version == "1.5.0":
-        size = "xs"
-    path = HF_PATH.format(size=size, version=version)
-    if urlparse(path).scheme:
-        path, _ = urlretrieve(path)
+    path = _download_pet_mad_checkpoint(version)
 
     # copy dataset with forces to here
     dataset = ase.io.read(DATASET_WITH_FORCES_PATH, index=f":{NUM_SYSTEMS}")
