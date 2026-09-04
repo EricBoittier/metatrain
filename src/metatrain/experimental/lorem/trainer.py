@@ -28,7 +28,6 @@ from metatrain.utils.distributed.slurm import (
     resolve_distributed,
 )
 from metatrain.utils.evaluate_model import evaluate_model
-from metatrain.utils.hypers import init_with_defaults
 from metatrain.utils.io import check_file_extension
 from metatrain.utils.logging import ROOT_LOGGER, MetricLogger
 from metatrain.utils.loss import LossAggregator, LossSpecification
@@ -69,8 +68,12 @@ def _expand_loss_config(
     if isinstance(loss_hypers, str):
         expanded: Dict[str, LossSpecification] = {}
         for target_name in train_targets:
-            spec = init_with_defaults(LossSpecification)
-            spec["type"] = loss_hypers
+            spec: LossSpecification = {
+                "type": loss_hypers,
+                "weight": 1.0,
+                "reduction": "mean",
+                "gradients": {},
+            }
             expanded[target_name] = spec
         return expanded
     return dict(loss_hypers)
