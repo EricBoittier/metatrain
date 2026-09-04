@@ -1,0 +1,227 @@
+import math
+from typing import List, Tuple
+
+import torch
+from metatomic.torch import NeighborListOptions, System
+
+from .structures import concatenate_structures
+
+
+def _cosine_cutoff(r: torch.Tensor, cutoff: float, width: float) -> torch.Tensor:
+    """Smooth cosine cutoff: 1 below ``cutoff - width``, 0 at ``cutoff``."""
+    if width <= 0.0:
+        return (r < cutoff).to(r.dtype)
+    onset = cutoff - width
+    envelope = 0.5 * (torch.cos(math.pi * (r - onset) / width) + 1.0)
+    return torch.where(
+        r >= cutoff,
+        torch.zeros_like(r),
+        torch.where(r <= onset, torch.ones_like(r), envelope),
+    )
+
+
+def _bessel_basis(r: torch.Tensor, n_radial: int, cutoff: float) -> torch.Tensor:
+    """Sinc Bessel radial basis of shape ``(n_edges, n_radial)``."""
+    n = torch.arange(1, n_radial + 1, device=r.device, dtype=r.dtype)
+    r_safe = torch.clamp(r, min=1.0e-8).unsqueeze(-1)
+    return math.sqrt(2.0 / cutoff) * torch.sin(n * math.pi * r_safe / cutoff) / r_safe
+
+
+def _real_spherical_harmonics(vectors: torch.Tensor, l_max: int) -> torch.Tensor:
+    """Real orthonormal spherical harmonics for ``l_max <= 2``.
+
+    :param vectors: Cartesian displacements of shape ``(n_edges, 3)``.
+    :param l_max: Maximum angular momentum (0, 1, or 2).
+    :return: ``(n_edges, (l_max + 1) ** 2)`` real spherical harmonics.
+    """
+    n_lm = (l_max + 1) * (l_max + 1)
+    if vectors.shape[0] == 0:
+        return vectors.new_zeros((0, n_lm))
+    if l_max > 2:
+        raise RuntimeError(
+            "Analytic spherical harmonics only support max_degree <= 2. "
+            "Install sphericart-torch for higher degrees."
+        )
+
+    r = torch.linalg.vector_norm(vectors, dim=-1, keepdim=True).clamp(min=1.0e-12)
+    x = vectors[:, 0:1] / r
+    y = vectors[:, 1:2] / r
+    z = vectors[:, 2:3] / r
+
+    # Orthonormal real SH, m = -l ... +l within each l.
+    y00 = torch.full_like(x, 0.28209479177387814)
+    parts: List[torch.Tensor] = [y00]
+    if l_max >= 1:
+        c1 = 0.4886025119029199  # sqrt(3 / 4pi)
+        parts.extend([c1 * y, c1 * z, c1 * x])
+    if l_max >= 2:
+        c2 = 1.0925484305920792  # sqrt(15 / 4pi)
+        c20 = 0.31539156525252005  # sqrt(5 / 16pi)
+        c22 = 0.5462742152960396  # sqrt(15 / 16pi)
+        parts.extend(
+            [
+                c2 * x * y,
+                c2 * y * z,
+                c20 * (3.0 * z * z - 1.0),
+                c2 * x * z,
+                c22 * (x * x - y * y),
+            ]
+        )
+    return torch.cat(parts, dim=-1)
+
+
+class _AnalyticSphericalHarmonics(torch.nn.Module):
+    """TorchScript-friendly real SH for ``l_max <= 2``."""
+
+    def __init__(self, l_max: int) -> None:
+        super().__init__()
+        self.l_max = l_max
+
+    def forward(self, vectors: torch.Tensor) -> torch.Tensor:
+        return _real_spherical_harmonics(vectors, self.l_max)
+
+
+class _SphericartWrapper(torch.nn.Module):
+    """Wrap ``sphericart.torch.SphericalHarmonics.compute`` as ``forward``."""
+
+    def __init__(self, calculator: torch.nn.Module) -> None:
+        super().__init__()
+        self.calculator = calculator
+
+    def forward(self, vectors: torch.Tensor) -> torch.Tensor:
+        return self.calculator.compute(vectors)
+
+
+class LoremBackbone(torch.nn.Module):
+    """Short-range spherical density + optional scalar message passing."""
+
+    def __init__(
+        self,
+        hypers: dict,
+        atomic_types: List[int],
+        neighbor_list_options: NeighborListOptions,
+    ) -> None:
+        super().__init__()
+        self.cutoff = float(hypers["cutoff"])
+        self.cutoff_width = float(hypers["cutoff_width"])
+        self.max_degree = int(hypers["max_degree"])
+        self.num_radial = int(hypers["num_radial"])
+        self.num_features = int(hypers["num_features"])
+        self.num_message_passing = int(hypers["num_message_passing"])
+        self.n_lm = (self.max_degree + 1) * (self.max_degree + 1)
+        self.n_invariants = self.num_radial * (self.max_degree + 1)
+        self.neighbor_list_options = neighbor_list_options
+
+        max_z = max(atomic_types) if len(atomic_types) > 0 else 0
+        self.species_embedding = torch.nn.Embedding(max_z + 1, self.num_features)
+
+        self.feature_mlp = torch.nn.Sequential(
+            torch.nn.Linear(self.num_features + self.n_invariants, self.num_features),
+            torch.nn.SiLU(),
+            torch.nn.Linear(self.num_features, self.num_features),
+        )
+
+        self.mp_layers = torch.nn.ModuleList(
+            [
+                torch.nn.Sequential(
+                    torch.nn.Linear(2 * self.num_features, self.num_features),
+                    torch.nn.SiLU(),
+                    torch.nn.Linear(self.num_features, self.num_features),
+                )
+                for _ in range(self.num_message_passing)
+            ]
+        )
+
+        if self.max_degree > 2:
+            try:
+                from sphericart.torch import SphericalHarmonics
+            except ImportError as err:
+                raise ImportError(
+                    "sphericart-torch is required for LOREM with max_degree > 2. "
+                    "Install it with `pip install metatrain[lorem]`."
+                ) from err
+            self.spherical_harmonics = _SphericartWrapper(
+                SphericalHarmonics(l_max=self.max_degree, normalized=True)
+            )
+        else:
+            self.spherical_harmonics = _AnalyticSphericalHarmonics(self.max_degree)
+
+    def _invariant_density(self, density: torch.Tensor) -> torch.Tensor:
+        """Contract ``(n_atoms, n_radial, n_lm)`` to rotationally invariant features."""
+        parts: List[torch.Tensor] = []
+        for ell in range(self.max_degree + 1):
+            start = ell * ell
+            end = (ell + 1) * (ell + 1)
+            chunk = density[:, :, start:end]
+            if ell == 0:
+                parts.append(chunk.squeeze(-1))
+            else:
+                parts.append(torch.linalg.vector_norm(chunk, dim=-1))
+        return torch.cat(parts, dim=-1)
+
+    def forward(self, systems: List[System]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return per-atom features and neighbor distances.
+
+        :param systems: Batch of systems with the requested neighbor list attached.
+        :return: ``(features, neighbor_distances)`` where ``features`` has shape
+            ``(n_atoms_total, num_features)``.
+        """
+        (
+            positions,
+            centers,
+            neighbors,
+            species,
+            cells,
+            cell_shifts,
+        ) = concatenate_structures(systems, self.neighbor_list_options)
+
+        device = positions.device
+        dtype = positions.dtype
+        n_atoms = positions.shape[0]
+        features = self.species_embedding(species)
+
+        if len(cells) == 1:
+            cell_contributions = cell_shifts.to(dtype) @ cells[0]
+        else:
+            system_sizes = torch.tensor(
+                [len(system) for system in systems], device=device
+            )
+            system_indices = torch.repeat_interleave(
+                torch.arange(len(systems), device=device), system_sizes
+            )
+            cell_contributions = torch.einsum(
+                "ab, abc -> ac",
+                cell_shifts.to(dtype),
+                cells[system_indices][centers],
+            )
+
+        vectors = positions[neighbors] - positions[centers] + cell_contributions
+        distances = torch.linalg.vector_norm(vectors, dim=-1)
+        cutoff_weights = _cosine_cutoff(distances, self.cutoff, self.cutoff_width)
+        radial = _bessel_basis(distances, self.num_radial, self.cutoff)
+        radial = radial * cutoff_weights.unsqueeze(-1)
+
+        sh = self.spherical_harmonics(vectors)
+        edge_density = (radial.unsqueeze(-1) * sh.unsqueeze(1)).reshape(
+            distances.shape[0], self.num_radial * self.n_lm
+        )
+        density_flat = torch.zeros(
+            n_atoms, self.num_radial * self.n_lm, device=device, dtype=dtype
+        )
+        if edge_density.shape[0] > 0:
+            density_flat.index_add_(0, centers, edge_density)
+        density = density_flat.view(n_atoms, self.num_radial, self.n_lm)
+        invariants = self._invariant_density(density)
+        features = self.feature_mlp(torch.cat([features, invariants], dim=-1))
+
+        for layer in self.mp_layers:
+            messages = layer(
+                torch.cat([features[centers], features[neighbors]], dim=-1)
+            )
+            messages = messages * cutoff_weights.unsqueeze(-1)
+            update = torch.zeros_like(features)
+            if messages.shape[0] > 0:
+                update.index_add_(0, centers, messages)
+            features = features + update
+
+        return features, distances

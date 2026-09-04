@@ -30,6 +30,11 @@ Fixed
 Added
 #####
 
+- Experimental ``experimental.lorem`` architecture: a PyTorch / TorchScript
+  port of LOREM (*Learning Long-Range Representations with Equivariant
+  Messages*, https://arxiv.org/abs/2507.19382) for energy training and
+  metatomic export.
+
 Changed
 #######
 
