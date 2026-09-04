@@ -45,12 +45,13 @@ def _small_lr_hypers(max_degree=1, max_degree_lr=1, use_ewald=True):
 
 
 def _chain_system(pbc=True):
+    cell = torch.eye(3) * 10 if pbc else torch.zeros(3, 3)
     return System(
         types=torch.tensor([6, 6, 8, 8]),
         positions=torch.tensor(
             [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 2.0], [0.0, 0.0, 3.0]]
         ),
-        cell=torch.eye(3) * 10,
+        cell=cell,
         pbc=torch.tensor([pbc, pbc, pbc]),
     )
 
