@@ -21,13 +21,16 @@ from metatrain.utils.data import TargetInfo
 from metatrain.utils.data.atom_pair_helpers import check_no_atom_pair_targets
 from metatrain.utils.data.dataset import DatasetInfo
 from metatrain.utils.dtype import dtype_to_str
-from metatrain.utils.long_range import DummyLongRangeFeaturizer, LongRangeFeaturizer
 from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.sum_over_atoms import sum_over_atoms
 
 from . import checkpoints
 from .documentation import ModelHypers
 from .modules.backbone import LoremBackbone
+from .modules.long_range import (
+    DummyLoremLongRangeFeaturizer,
+    LoremLongRangeFeaturizer,
+)
 
 
 class LOREM(ModelInterface[ModelHypers]):
@@ -65,17 +68,26 @@ class LOREM(ModelInterface[ModelHypers]):
             self.requested_nl,
         )
         self.num_features = int(self.hypers["num_features"])
+        self.max_degree_lr = int(self.hypers["max_degree_lr"])
+        if self.max_degree_lr > int(self.hypers["max_degree"]):
+            raise ValueError(
+                f"max_degree_lr ({self.max_degree_lr}) cannot exceed "
+                f"max_degree ({self.hypers['max_degree']})."
+            )
 
         if self.hypers["long_range"]["enable"]:
             self.long_range = True
-            self.long_range_featurizer = LongRangeFeaturizer(
+            self.long_range_featurizer = LoremLongRangeFeaturizer(
                 self.hypers["long_range"],
                 self.num_features,
+                int(self.hypers["num_radial"]),
+                int(self.hypers["num_spherical_features"]),
+                self.max_degree_lr,
                 self.requested_nl,
             )
         else:
             self.long_range = False
-            self.long_range_featurizer = DummyLongRangeFeaturizer()
+            self.long_range_featurizer = DummyLoremLongRangeFeaturizer()
 
         self.outputs: Dict[str, ModelOutput] = {}
         self.readouts = torch.nn.ModuleDict({})
@@ -152,12 +164,12 @@ class LOREM(ModelInterface[ModelHypers]):
                 for name, properties_tmap in self.property_labels.items()
             }
 
-        features, neighbor_distances = self.backbone(systems)
+        features, neighbor_distances, spherical_features = self.backbone(systems)
         if self.long_range:
             if self.training:
                 self.long_range_featurizer.use_ewald = True
-            features = features + self.long_range_featurizer(
-                systems, features, neighbor_distances
+            features = self.long_range_featurizer(
+                systems, features, neighbor_distances, spherical_features
             )
 
         system_sizes = [len(system) for system in systems]

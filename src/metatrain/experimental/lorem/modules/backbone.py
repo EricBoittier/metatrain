@@ -159,12 +159,16 @@ class LoremBackbone(torch.nn.Module):
                 parts.append(torch.linalg.vector_norm(chunk, dim=-1))
         return torch.cat(parts, dim=-1)
 
-    def forward(self, systems: List[System]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return per-atom features and neighbor distances.
+    def forward(
+        self, systems: List[System]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return per-atom scalar features, neighbor distances, and spherical features.
 
         :param systems: Batch of systems with the requested neighbor list attached.
-        :return: ``(features, neighbor_distances)`` where ``features`` has shape
-            ``(n_atoms_total, num_features)``.
+        :return: ``(features, neighbor_distances, spherical_features)`` where
+            ``features`` is ``(n_atoms_total, num_features)`` and
+            ``spherical_features`` is the neighbor density as
+            ``(n_atoms_total, (max_degree + 1) ** 2, num_radial)``.
         """
         (
             positions,
@@ -212,6 +216,7 @@ class LoremBackbone(torch.nn.Module):
             density_flat.index_add_(0, centers, edge_density)
         density = density_flat.view(n_atoms, self.num_radial, self.n_lm)
         invariants = self._invariant_density(density)
+        spherical_features = density.transpose(1, 2)
         features = self.feature_mlp(torch.cat([features, invariants], dim=-1))
 
         for layer in self.mp_layers:
@@ -224,4 +229,4 @@ class LoremBackbone(torch.nn.Module):
                 update.index_add_(0, centers, messages)
             features = features + update
 
-        return features, distances
+        return features, distances, spherical_features

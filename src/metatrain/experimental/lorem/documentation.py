@@ -15,18 +15,20 @@ architecture is a metatrain-native port so that models can be trained with
 The short-range block builds a spherical-harmonic neighbor density (Bessel
 radial basis × real spherical harmonics), contracts it to rotationally
 invariant features, and optionally applies a few scalar message-passing
-updates. The long-range block maps those features to multi-channel charges and
-evaluates their Coulomb potential with
-`torch-pme <https://github.com/lab-cosmo/torch-pme>`_ (Ewald / P3M / direct),
-reusing :class:`metatrain.utils.long_range.LongRangeFeaturizer`.
+updates. The long-range block maps scalar features to a charge channel and
+spherical features to charges up to ``max_degree_lr``, then evaluates their
+Coulomb potential in parallel with
+`torch-pme <https://github.com/lab-cosmo/torch-pme>`_ (Ewald / P3M / direct).
+That is the paper's equivariant long-range message: Ewald summation over each
+:math:`(\\ell, m)` independently.
 
 .. note::
 
    This experimental port predicts **scalar** targets (typically energy, with
-   forces via autograd). Full SO(3)-equivariant long-range charges up to
-   ``max_degree_lr`` as in ``lorem-jax`` are approximated here by multi-channel
-   scalar charges. Born-effective-charge (``LoremBEC``) heads are not yet
-   implemented.
+   forces via autograd). Spherical charges use a per-:math:`\\ell` linear map
+   (weights shared across :math:`m`). The ``lorem-jax`` Clebsch-Gordan
+   self-product (``e3x.nn.TensorDense``) and Born-effective-charge
+   (``LoremBEC``) heads are not yet implemented.
 
 {{SECTION_INSTALLATION}}
 
@@ -100,22 +102,22 @@ class ModelHypers(TypedDict):
     """Maximum angular momentum :math:`\\ell` of the short-range spherical
     density. Values above 2 require ``sphericart-torch``."""
     max_degree_lr: int = 2
-    """Maximum angular momentum of long-range charges in the original LOREM
-    model. Reserved for a future equivariant-charge path; the current
-    implementation uses multi-channel scalar charges."""
+    """Maximum angular momentum of long-range charges. Ewald / P3M / direct
+    summation is run independently on each :math:`(\\ell, m)` channel, plus
+    one extra scalar charge from the invariant features. Must not exceed
+    ``max_degree``. The paper default is 2 (10 charge channels)."""
     num_features: int = 128
     """Dimension of invariant atom features and of the energy readout."""
     num_spherical_features: int = 8
-    """Number of spherical feature channels in the original LOREM model.
-    Unused in this experimental port; kept for compatibility with
-    ``lorem-jax`` hypers."""
+    """Number of channels in the long-range spherical charge pathway, after a
+    per-:math:`\\ell` linear projection of the short-range radial density."""
     num_radial: int = 32
     """Number of Bessel radial basis functions."""
     num_message_passing: int = 0
     """Number of additional scalar message-passing layers after the spherical
     density. The paper default is 0 (descriptor + long-range only)."""
     long_range: LoremLongRangeHypers = init_with_defaults(LoremLongRangeHypers)
-    """Long-range Coulomb features from learned atomic charges."""
+    """Long-range Coulomb features from learned equivariant atomic charges."""
 
 
 ##############################

@@ -1,4 +1,5 @@
 import copy
+import math
 
 import pytest
 
@@ -19,10 +20,8 @@ from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
 from . import DATASET_WITH_FORCES_PATH, DEFAULT_HYPERS, MODEL_HYPERS
 
 
-@pytest.mark.parametrize("use_ewald", [True, False])
-def test_long_range_features(use_ewald):
-    """Long-range Coulomb features can be evaluated for a tiny periodic system."""
-    dataset_info = DatasetInfo(
+def _energy_dataset_info():
+    return DatasetInfo(
         length_unit="Angstrom",
         atomic_types=[1, 6, 7, 8],
         targets={
@@ -31,25 +30,134 @@ def test_long_range_features(use_ewald):
             )
         },
     )
+
+
+def _small_lr_hypers(max_degree=1, max_degree_lr=1, use_ewald=True):
     hypers = copy.deepcopy(MODEL_HYPERS)
-    hypers["max_degree"] = 1
+    hypers["max_degree"] = max_degree
+    hypers["max_degree_lr"] = max_degree_lr
     hypers["num_features"] = 8
+    hypers["num_spherical_features"] = 2
     hypers["num_radial"] = 4
     hypers["long_range"]["enable"] = True
     hypers["long_range"]["use_ewald"] = use_ewald
-    model = LOREM(hypers, dataset_info)
+    return hypers
 
-    system = System(
+
+def _chain_system(pbc=True):
+    return System(
         types=torch.tensor([6, 6, 8, 8]),
         positions=torch.tensor(
             [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 2.0], [0.0, 0.0, 3.0]]
         ),
         cell=torch.eye(3) * 10,
-        pbc=torch.tensor([True, True, True]),
+        pbc=torch.tensor([pbc, pbc, pbc]),
     )
-    system = get_system_with_neighbor_lists(system, model.requested_neighbor_lists())
+
+
+@pytest.mark.parametrize("use_ewald", [True, False])
+def test_long_range_features(use_ewald):
+    """Long-range Coulomb features can be evaluated for a tiny periodic system."""
+    model = LOREM(_small_lr_hypers(use_ewald=use_ewald), _energy_dataset_info())
+    system = get_system_with_neighbor_lists(
+        _chain_system(), model.requested_neighbor_lists()
+    )
     outputs = {"energy": ModelOutput(sample_kind="system")}
     model([system, system], outputs)
+
+
+def test_max_degree_lr_cannot_exceed_max_degree():
+    hypers = _small_lr_hypers(max_degree=1, max_degree_lr=2)
+    with pytest.raises(ValueError, match="max_degree_lr"):
+        LOREM(hypers, _energy_dataset_info())
+
+
+def test_long_range_energy_rotation_invariant():
+    """System energy is unchanged when the molecule is rotated."""
+    hypers = _small_lr_hypers(max_degree=2, max_degree_lr=2, use_ewald=True)
+    model = LOREM(hypers, _energy_dataset_info())
+    model.eval()
+
+    system = _chain_system(pbc=False)
+    theta = math.pi / 3.0
+    rotation = torch.tensor(
+        [
+            [math.cos(theta), -math.sin(theta), 0.0],
+            [math.sin(theta), math.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    rotated = System(
+        types=system.types,
+        positions=system.positions @ rotation.T,
+        cell=system.cell,
+        pbc=system.pbc,
+    )
+
+    options = model.requested_neighbor_lists()
+    system = get_system_with_neighbor_lists(system, options)
+    rotated = get_system_with_neighbor_lists(rotated, options)
+    outputs = {"energy": ModelOutput(sample_kind="system")}
+
+    energy = model([system], outputs)["energy"].block().values
+    energy_rotated = model([rotated], outputs)["energy"].block().values
+    torch.testing.assert_close(energy, energy_rotated, atol=1e-5, rtol=1e-5)
+
+
+def test_spherical_charges_rotate_as_vectors():
+    """ℓ=1 long-range charges transform as Cartesian vectors under rotation."""
+    hypers = _small_lr_hypers(max_degree=1, max_degree_lr=1, use_ewald=True)
+    model = LOREM(hypers, _energy_dataset_info())
+    model.eval()
+
+    system = _chain_system(pbc=False)
+    theta = math.pi / 5.0
+    # Real SH ℓ=1 order is Y, Z, X. A rotation about z mixes X and Y only.
+    rotation = torch.tensor(
+        [
+            [math.cos(theta), -math.sin(theta), 0.0],
+            [math.sin(theta), math.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    rotated = System(
+        types=system.types,
+        positions=system.positions @ rotation.T,
+        cell=system.cell,
+        pbc=system.pbc,
+    )
+    options = model.requested_neighbor_lists()
+    system = get_system_with_neighbor_lists(system, options)
+    rotated = get_system_with_neighbor_lists(rotated, options)
+
+    features, _, spherical = model.backbone([system])
+    features_rot, _, spherical_rot = model.backbone([rotated])
+    charges = model.long_range_featurizer.map_charges(features, spherical)
+    charges_rot = model.long_range_featurizer.map_charges(features_rot, spherical_rot)
+
+    # channels: [scalar, Y00, Y1,-1 (y), Y1,0 (z), Y1,+1 (x)]
+    dipole = charges[:, 2:5]
+    dipole_rot = charges_rot[:, 2:5]
+    # Components are (y, z, x). Rotate the Cartesian vector (x, y, z).
+    xyz = torch.stack([dipole[:, 2], dipole[:, 0], dipole[:, 1]], dim=-1)
+    xyz_expected = xyz @ rotation.T
+    dipole_expected = torch.stack(
+        [xyz_expected[:, 1], xyz_expected[:, 2], xyz_expected[:, 0]], dim=-1
+    )
+    torch.testing.assert_close(dipole_rot, dipole_expected, atol=1e-5, rtol=1e-5)
+
+
+def test_long_range_torchscript():
+    """The equivariant long-range path is TorchScript-compilable."""
+    model = LOREM(_small_lr_hypers(), _energy_dataset_info())
+    scripted = torch.jit.script(model)
+    system = get_system_with_neighbor_lists(
+        _chain_system(), model.requested_neighbor_lists()
+    )
+    outputs = {"energy": ModelOutput(sample_kind="system")}
+    eager = model([system], outputs)["energy"].block().values
+    compiled = scripted([system], outputs)["energy"].block().values
+    torch.testing.assert_close(eager, compiled, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("use_ewald", [True, False])
@@ -81,12 +189,7 @@ def test_long_range_training(use_ewald):
     dataset_info = DatasetInfo(
         length_unit="Angstrom", atomic_types=[6], targets=target_info_dict
     )
-    model_hypers = copy.deepcopy(MODEL_HYPERS)
-    model_hypers["max_degree"] = 1
-    model_hypers["num_features"] = 8
-    model_hypers["num_radial"] = 4
-    model_hypers["long_range"]["enable"] = True
-    model_hypers["long_range"]["use_ewald"] = use_ewald
+    model_hypers = _small_lr_hypers(use_ewald=use_ewald)
     model = LOREM(model_hypers, dataset_info)
 
     trainer = Trainer(hypers["training"])
