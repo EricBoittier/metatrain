@@ -172,29 +172,31 @@ class LOREM(ModelInterface[ModelHypers]):
         samples = Labels(names=["system", "atom"], values=sample_values.to(torch.int32))
 
         return_dict: Dict[str, TensorMap] = {}
-        for output_name, output in outputs.items():
-            if output_name not in self.readouts:
-                continue
-            atomic_values = self.readouts[output_name](features)
-            atomic_property = TensorMap(
-                self.key_labels[output_name],
-                [
-                    TensorBlock(
-                        values=atomic_values,
-                        samples=samples,
-                        components=self.component_labels[output_name][0],
-                        properties=self.property_labels[output_name][0],
-                    )
-                ],
-            )
-            if selected_atoms is not None:
-                atomic_property = mts.slice(
-                    atomic_property, axis="samples", selection=selected_atoms
+        # Enumerate ModuleDict so TorchScript can compile (no variable-key
+        # indexing, and no ``continue`` inside the unrolled loop).
+        for readout_name, readout in self.readouts.items():
+            if readout_name in outputs:
+                output = outputs[readout_name]
+                atomic_values = readout(features)
+                atomic_property = TensorMap(
+                    self.key_labels[readout_name],
+                    [
+                        TensorBlock(
+                            values=atomic_values,
+                            samples=samples,
+                            components=self.component_labels[readout_name][0],
+                            properties=self.property_labels[readout_name][0],
+                        )
+                    ],
                 )
-            if output.sample_kind == "atom":
-                return_dict[output_name] = atomic_property
-            else:
-                return_dict[output_name] = sum_over_atoms(atomic_property)
+                if selected_atoms is not None:
+                    atomic_property = mts.slice(
+                        atomic_property, axis="samples", selection=selected_atoms
+                    )
+                if output.sample_kind == "atom":
+                    return_dict[readout_name] = atomic_property
+                else:
+                    return_dict[readout_name] = sum_over_atoms(atomic_property)
 
         if not self.training:
             return_dict = self.scaler.apply_scales(

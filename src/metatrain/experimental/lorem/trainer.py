@@ -1,7 +1,7 @@
 import copy
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Union, cast
+from typing import Any, Dict, List, Literal, Union
 
 import torch
 import torch.distributed
@@ -28,6 +28,7 @@ from metatrain.utils.distributed.slurm import (
     resolve_distributed,
 )
 from metatrain.utils.evaluate_model import evaluate_model
+from metatrain.utils.hypers import init_with_defaults
 from metatrain.utils.io import check_file_extension
 from metatrain.utils.logging import ROOT_LOGGER, MetricLogger
 from metatrain.utils.loss import LossAggregator, LossSpecification
@@ -58,6 +59,21 @@ _MIN_LEARNING_RATE = 1e-7
 def _get_raw_model(model: Union[LOREM, DistributedDataParallel], is_distributed: bool):
     """Unwrap a possibly-DDP-wrapped model to get the underlying LOREM."""
     return model.module if is_distributed else model
+
+
+def _expand_loss_config(
+    loss_hypers: str | Dict[str, LossSpecification],
+    train_targets: Dict[str, Any],
+) -> Dict[str, LossSpecification]:
+    """Turn a global loss name such as ``mse`` into a per-target config."""
+    if isinstance(loss_hypers, str):
+        expanded: Dict[str, LossSpecification] = {}
+        for target_name in train_targets:
+            spec = init_with_defaults(LossSpecification)
+            spec["type"] = loss_hypers
+            expanded[target_name] = spec
+        return expanded
+    return dict(loss_hypers)
 
 
 class Trainer(TrainerInterface[TrainerHypers]):
@@ -250,7 +266,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 outputs_list.append(f"{target_name}_{gradient_name}_gradients")
 
         # Create a loss function:
-        loss_hypers = cast(Dict[str, LossSpecification], self.hypers["loss"])  # mypy
+        loss_hypers = _expand_loss_config(self.hypers["loss"], train_targets)
         loss_fn = LossAggregator(
             targets=train_targets,
             config=loss_hypers,
