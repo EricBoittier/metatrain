@@ -4,6 +4,8 @@ from typing import List, Tuple
 import torch
 from metatomic.torch import NeighborListOptions, System
 
+from .radial import bernstein_basis, bessel_basis, binomial_row
+from .spherical import to_racah
 from .structures import concatenate_structures
 from .tensor_dense import TensorDense
 
@@ -37,9 +39,7 @@ def _cosine_cutoff(r: torch.Tensor, cutoff: float, width: float) -> torch.Tensor
 
 def _bessel_basis(r: torch.Tensor, n_radial: int, cutoff: float) -> torch.Tensor:
     """Sinc Bessel radial basis of shape ``(n_edges, n_radial)``."""
-    n = torch.arange(1, n_radial + 1, device=r.device, dtype=r.dtype)
-    r_safe = torch.clamp(r, min=1.0e-8).unsqueeze(-1)
-    return math.sqrt(2.0 / cutoff) * torch.sin(n * math.pi * r_safe / cutoff) / r_safe
+    return bessel_basis(r, n_radial, cutoff)
 
 
 def _safe_vector_norm(x: torch.Tensor, dim: int, eps: float = 1.0e-12) -> torch.Tensor:
@@ -136,7 +136,18 @@ class LoremBackbone(torch.nn.Module):
         self.num_features = int(hypers["num_features"])
         self.num_spherical_features = int(hypers["num_spherical_features"])
         self.num_message_passing = int(hypers["num_message_passing"])
+        self.use_bernstein = (
+            str(hypers["radial_basis"]) == "basic_bernstein"
+            if "radial_basis" in hypers
+            else True
+        )
+        self.use_e3x_sh = (
+            str(hypers["sh_convention"]) == "e3x" if "sh_convention" in hypers else True
+        )
         self.n_lm = (self.max_degree + 1) * (self.max_degree + 1)
+        self.register_buffer(
+            "bernstein_coeff", binomial_row(self.num_radial).to(torch.float32)
+        )
         self.n_invariants = self.num_radial * (self.max_degree + 1)
         self.neighbor_list_options = neighbor_list_options
 
@@ -258,10 +269,15 @@ class LoremBackbone(torch.nn.Module):
         vectors = positions[neighbors] - positions[centers] + cell_contributions
         distances = torch.linalg.vector_norm(vectors, dim=-1)
         cutoff_weights = _cosine_cutoff(distances, self.cutoff, self.cutoff_width)
-        radial = _bessel_basis(distances, self.num_radial, self.cutoff)
+        if self.use_bernstein:
+            radial = bernstein_basis(distances, self.cutoff, self.bernstein_coeff)
+        else:
+            radial = bessel_basis(distances, self.num_radial, self.cutoff)
         radial = radial * cutoff_weights.unsqueeze(-1)
 
         sh = self.spherical_harmonics(vectors)
+        if self.use_e3x_sh:
+            sh = to_racah(sh, self.max_degree)
         edge_density = (radial.unsqueeze(-1) * sh.unsqueeze(1)).reshape(
             distances.shape[0], self.num_radial * self.n_lm
         )
