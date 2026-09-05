@@ -33,6 +33,7 @@ from metatrain.utils.architectures import get_default_hypers
 
 from . import MODEL_HYPERS
 
+
 # Defaults copied from lorem-jax ``src/lorem/models/mlip.py`` class ``Lorem``.
 # CI does not import JAX; keep this table in sync by hand.
 LOREM_JAX_LOREM_DEFAULTS = {
