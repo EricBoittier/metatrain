@@ -27,16 +27,18 @@ from metatrain.utils.sum_over_atoms import sum_over_atoms
 
 from . import checkpoints
 from .documentation import ModelHypers
+from .flax_io import apply_flax_params
 from .modules.backbone import LoremBackbone
 from .modules.bec import BornEffectiveChargeHead, apply_acoustic_sum_rule
 from .modules.long_range import (
     DummyLoremLongRangeFeaturizer,
     LoremLongRangeFeaturizer,
 )
+from .modules.pet_trunk import PetTrunk
 
 
 class LOREM(ModelInterface[ModelHypers]):
-    __checkpoint_version__ = 2
+    __checkpoint_version__ = 3
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -66,11 +68,19 @@ class LOREM(ModelInterface[ModelHypers]):
             strict=True,
         )
         # iris PETLR scopes: short-range trunk is ``sr``, long-range is ``lr``.
-        self.sr = LoremBackbone(
-            dict(self.hypers),
-            self.atomic_types,
-            self.requested_nl,
-        )
+        trunk = str(self.hypers["trunk"]) if "trunk" in self.hypers else "spherical"
+        if trunk == "pet":
+            self.sr = PetTrunk(
+                dict(self.hypers),
+                self.atomic_types,
+                self.requested_nl,
+            )
+        else:
+            self.sr = LoremBackbone(
+                dict(self.hypers),
+                self.atomic_types,
+                self.requested_nl,
+            )
         self.num_features = int(self.hypers["num_features"])
         self.max_degree_lr = int(self.hypers["max_degree_lr"])
         if self.max_degree_lr > int(self.hypers["max_degree"]):
@@ -341,6 +351,19 @@ class LOREM(ModelInterface[ModelHypers]):
         )
         self.scaler.restart(dataset_info)
         return self
+
+    def load_flax_weights(
+        self,
+        flax_tree: Mapping[str, Any],
+        name_map: Optional[Dict[str, str]] = None,
+    ) -> List[str]:
+        """Copy compatible Flax / lorem-jax leaves into this model.
+
+        :param flax_tree: Nested Flax parameter dict (optional ``params`` wrap).
+        :param name_map: Optional ``torch.name → flax.flat.name`` overrides.
+        :return: Names of torch parameters that were overwritten.
+        """
+        return apply_flax_params(self, flax_tree, name_map=name_map)
 
     @classmethod
     def load_checkpoint(

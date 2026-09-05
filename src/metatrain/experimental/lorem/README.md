@@ -31,13 +31,16 @@ flowchart TD
     PetTrunk --> NodeEmb --> ChargeMLP --> TiledEwald --> LrHead
   end
   subgraph loremPt [experimental.lorem]
-    Spherical["Bessel x SH + TensorDense"]
+    Spherical["Bernstein x Racah SH + TensorDense"]
+    PetOpt["optional PetTrunk"]
     EqCharges["scalar + CG spherical charges"]
     TorchPme["torch-pme Ewald / P3M / direct"]
     FeatUpdate["CG mix * lr_scale into scalar features"]
     BecHead["LoremBEC 3x3 APT"]
     Spherical --> EqCharges --> TorchPme --> FeatUpdate
+    PetOpt --> EqCharges
     Spherical --> BecHead
+    PetOpt --> BecHead
   end
   subgraph petLr [metatrain PET long_range]
     PetBackbone[PET backend]
@@ -83,9 +86,11 @@ optional `LoremBEC` APT head (acoustic sum rule).
 
 Paper-shaped TorchScript port for `mtt` + metatomic export.
 
-- [`LoremBackbone`](modules/backbone.py) (`sr`): Bessel × real SH,
-  then [`TensorDense`](modules/tensor_dense.py) (CG self-product, the
-  `e3x.nn.TensorDense` port). Optional scalar message passing.
+- [`LoremBackbone`](modules/backbone.py) (`sr`): e3x ``basic_bernstein``
+  × Racah SH (lorem-jax defaults; ``bessel`` / ``orthonormal`` remain
+  selectable), then [`TensorDense`](modules/tensor_dense.py) (CG
+  self-product). Optional scalar message passing. ``trunk: pet`` mounts
+  [`PetTrunk`](modules/pet_trunk.py) (``PETBackend`` + spherical sidecar).
 - [`LoremLongRangeFeaturizer`](modules/long_range.py) (`lr`): scalar
   charge MLP + `TensorDense` spherical charges; torch-pme Ewald / P3M /
   direct; CG [`TensorProduct`](modules/tensor_dense.py) mix; residual
@@ -99,9 +104,11 @@ Paper-shaped TorchScript port for `mtt` + metatomic export.
 Implemented versus the paper: CG `TensorDense` self-product, `LoremBEC`.
 
 Implemented versus iris, in metatrain style: `sr` / `lr` scopes,
-`lr_scale`. PET trunk, tiled jax-pme batching, and `warm_start_sr` stay
-on the `pet` architecture / the iris submodule — they are not a second
-PET inside this package.
+`lr_scale`, optional ``trunk: pet``, flax leaf transfer
+([`flax_io.py`](flax_io.py) / ``LOREM.load_flax_weights``), and
+[`pme_batch`](modules/pme_batch.py) padding / PBC-split helpers (iris
+``BM`` / mixed batch). torch-pme still evaluates one ``System`` at a
+time; k-space tiled Ewald stays in jax-pme.
 
 ## metatrain PET `long_range`
 
@@ -115,28 +122,32 @@ Coulomb path in this stack.
 
 | | iris PETLR | lorem-jax / paper | experimental.lorem | PET `long_range` |
 | --- | --- | --- | --- | --- |
-| SR trunk | `petjax.UPET` as `sr` | spherical + `TensorDense` | Bessel × SH + `TensorDense` (`sr`) | metatrain PET backend |
+| SR trunk | `petjax.UPET` as `sr` | spherical + `TensorDense` | Bernstein × Racah SH + `TensorDense`, or `PetTrunk` | metatrain PET backend |
 | Charges | `num_charges` scalars | CG spherical \((\ell, m)\) | scalar + CG `TensorDense` | `feature_dim` scalars |
-| LR engine | jax-pme **batched-tiled** | jax-pme Ewald | torch-pme Ewald / P3M / direct | torch-pme Ewald / P3M / direct |
+| LR engine | jax-pme **batched-tiled** | jax-pme Ewald | torch-pme list batch + ``BM`` pad helpers | torch-pme Ewald / P3M / direct |
 | How LR enters | energy × `lr_scale` | feature message | CG mix × `lr_scale` (`lr`) | `(node + lr) * 0.5**0.5` |
 | BEC / APT | no | `LoremBEC` | `BornEffectiveChargeHead` | no |
 | Forces / stress | conservative `predict` | autograd / BEC field | autograd on energy | PET heads |
-| Warm start | `warm_start_sr` | n/a | metatrain checkpoint | PET / PET-MAD checkpoint |
+| Warm start | `warm_start_sr` | flax ``model.msgpack`` | ``load_flax_weights`` + metatrain ckpt | PET / PET-MAD checkpoint |
 | Runtime | flax, `iris-train` | JAX | TorchScript `mtt` | TorchScript `mtt` |
 | Default LR | on | on | on (`lr_scale_init: 1.0`) | off |
 
 ## Checking parity
 
 This is a metatrain-native port. It uses the same *equations and knobs* as
-the paper / lorem-jax, plus iris-style `sr` / `lr` / `lr_scale`. **No
-bit-exact energy match** with JAX is claimed (different spherical
-harmonics, radial basis, PME, and RNG). iris PETLR is a cousin (PET trunk
-+ scalar charges), not a second implementation to regress against.
+the paper / lorem-jax, plus iris-style `sr` / `lr` / `lr_scale`. Defaults
+now use Bernstein + Racah SH; PME is still torch-pme (not jax-pme tiled
+k-space). **No bit-exact energy match** with JAX is claimed (RNG, PME
+implementation, and e3x cartesian vs ``m = -ℓ … +ℓ`` order). iris PETLR
+is available as ``trunk: pet`` (PET node features + spherical sidecar).
 
 Three layers:
 
 1. **In-repo contracts** (this package's tests, no JAX). Checklist:
    [`tests/test_paper_contracts.py`](tests/test_paper_contracts.py).
+   ``test_hypers_keys_overlap_lorem_jax`` prints both param-dict key
+   tables; ``test_torch_param_keys_follow_sr_lr_scopes`` prints the
+   ``named_parameters`` tree (``sr`` / ``lr``).
 2. **External train / eval** (optional, not in this repository):
    `etc/lorem-parity/` in [metawork](https://github.com/EricBoittier/metawork)
    after `git submodule update --init`. Run `mtt` there; run lorem-jax
@@ -146,6 +157,8 @@ Three layers:
 | Symbol | Test | Source |
 | --- | --- | --- |
 | paper default hypers | `test_default_hypers_match_paper` | `documentation.py` |
+| printed lorem-jax vs torch keys | `test_hypers_keys_overlap_lorem_jax` | `lorem.Lorem` fields |
+| printed ``sr`` / ``lr`` param tree | `test_torch_param_keys_follow_sr_lr_scopes` | iris PETLR scopes |
 | `l_factors = (2ℓ+1)^{1/4}` | `test_degree_norm_factor_is_two_ell_plus_one_to_the_quarter` | lorem-jax `Lorem` / `LoremBEC` |
 | cosine cutoff | `test_cosine_cutoff_is_one_inside_and_zero_at_cutoff` | e3x `cosine_cutoff` |
 | 1 + `(L_lr+1)²` charges | `test_charge_layout_is_scalar_plus_spherical_lm` | lorem-jax equivariant charges |
