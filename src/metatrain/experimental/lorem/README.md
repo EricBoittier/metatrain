@@ -125,6 +125,40 @@ Coulomb path in this stack.
 | Runtime | flax, `iris-train` | JAX | TorchScript `mtt` | TorchScript `mtt` |
 | Default LR | on | on | on (`lr_scale_init: 1.0`) | off |
 
+## Checking parity
+
+This is a metatrain-native port. It uses the same *equations and knobs* as
+the paper / lorem-jax, plus iris-style `sr` / `lr` / `lr_scale`. **No
+bit-exact energy match** with JAX is claimed (different spherical
+harmonics, radial basis, PME, and RNG). iris PETLR is a cousin (PET trunk
++ scalar charges), not a second implementation to regress against.
+
+Three layers:
+
+1. **In-repo contracts** (this package's tests, no JAX). Checklist:
+   [`tests/test_paper_contracts.py`](tests/test_paper_contracts.py).
+2. **External train / eval** (optional, not in this repository):
+   `etc/lorem-parity/` in [metawork](https://github.com/EricBoittier/metawork)
+   after `git submodule update --init`. Run `mtt` there; run lorem-jax
+   examples in a separate JAX venv.
+3. **This README** — what the four stacks are, and what we do not claim.
+
+| Symbol | Test | Source |
+| --- | --- | --- |
+| paper default hypers | `test_default_hypers_match_paper` | `documentation.py` |
+| `l_factors = (2ℓ+1)^{1/4}` | `test_degree_norm_factor_is_two_ell_plus_one_to_the_quarter` | lorem-jax `Lorem` / `LoremBEC` |
+| cosine cutoff | `test_cosine_cutoff_is_one_inside_and_zero_at_cutoff` | e3x `cosine_cutoff` |
+| 1 + `(L_lr+1)²` charges | `test_charge_layout_is_scalar_plus_spherical_lm` | lorem-jax equivariant charges |
+| `1 ⊗ 1 → 0` | `test_cg_one_otimes_one_to_scalar_is_dot_product` | e3x `TensorDense` |
+| acoustic sum rule | `test_bec_acoustic_sum_rule` | `lorem.LoremBEC` |
+| `lr_scale == 0` no-op | `test_lr_scale_zero_is_noop` | iris `PETLR` |
+| `sr` / `lr` scopes | `test_sr_lr_module_scopes` | iris `name="sr"` / `name="lr"` |
+| energy / ℓ=1 rotation | `test_long_range_energy_rotation_invariant`, `test_spherical_charges_rotate_as_vectors` | paper equivariance |
+| `TensorDense` scalars | `test_tensor_dense_scalar_is_rotation_invariant` | e3x `TensorDense` |
+
+CI does not import JAX, does not store golden JAX energies, and does not
+treat the two stacks as interchangeable.
+
 ## Stack
 
 iris and lorem-jax are separate JAX installs (see their READMEs).

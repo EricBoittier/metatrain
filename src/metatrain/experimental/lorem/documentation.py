@@ -30,6 +30,10 @@ That is the paper's equivariant long-range message: Ewald summation over each
    Clebsch-Gordan self-product (``TensorDense``, the ``e3x.nn.TensorDense``
    port). ``max_degree >= 2`` is required for BEC.
 
+   This is a metatrain-native port: same equations and knobs as the paper /
+   lorem-jax, not a bit-exact JAX clone. Developer comparison notes and the
+   in-repo contract tests live in the architecture ``README.md``.
+
 {{SECTION_INSTALLATION}}
 
 {{SECTION_DEFAULT_HYPERS}}
