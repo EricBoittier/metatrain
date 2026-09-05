@@ -149,9 +149,9 @@ class LoremLongRangeFeaturizer(torch.nn.Module):
             torch.nn.SiLU(),
             torch.nn.Linear(2 * feature_dim, feature_dim),
         )
-        lr_scale_init = (
-            float(hypers["lr_scale_init"]) if "lr_scale_init" in hypers else 1.0
-        )
+        extras: dict = dict(hypers)
+        raw_lr_scale = extras.get("lr_scale_init", 1.0)
+        lr_scale_init = float(raw_lr_scale) if raw_lr_scale is not None else 1.0
         self.lr_scale = torch.nn.Parameter(torch.tensor([lr_scale_init]))
         self.update_residual = torch.nn.Sequential(
             torch.nn.Linear(feature_dim, 2 * feature_dim),
