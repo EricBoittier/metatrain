@@ -97,6 +97,7 @@ dpa3 = [
 lorem = [
     "torch-pme>=0.3.2",
     "sphericart-torch>=2.0.3",
+    "wigners",
 ]
 
 [tool.check-manifest]
