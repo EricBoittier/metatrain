@@ -28,6 +28,7 @@ from metatrain.utils.sum_over_atoms import sum_over_atoms
 from . import checkpoints
 from .documentation import ModelHypers
 from .modules.backbone import LoremBackbone
+from .modules.bec import BornEffectiveChargeHead, apply_acoustic_sum_rule
 from .modules.long_range import (
     DummyLoremLongRangeFeaturizer,
     LoremLongRangeFeaturizer,
@@ -35,7 +36,7 @@ from .modules.long_range import (
 
 
 class LOREM(ModelInterface[ModelHypers]):
-    __checkpoint_version__ = 1
+    __checkpoint_version__ = 2
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -51,6 +52,7 @@ class LOREM(ModelInterface[ModelHypers]):
     )
 
     component_labels: Dict[str, List[List[Labels]]]
+    bec_targets: List[str]
 
     def __init__(self, hypers: ModelHypers, dataset_info: DatasetInfo) -> None:
         super().__init__(hypers, dataset_info, self.__default_metadata__)
@@ -63,7 +65,8 @@ class LOREM(ModelInterface[ModelHypers]):
             full_list=True,
             strict=True,
         )
-        self.backbone = LoremBackbone(
+        # iris PETLR scopes: short-range trunk is ``sr``, long-range is ``lr``.
+        self.sr = LoremBackbone(
             dict(self.hypers),
             self.atomic_types,
             self.requested_nl,
@@ -78,20 +81,22 @@ class LOREM(ModelInterface[ModelHypers]):
 
         if self.hypers["long_range"]["enable"]:
             self.long_range = True
-            self.long_range_featurizer = LoremLongRangeFeaturizer(
+            self.lr = LoremLongRangeFeaturizer(
                 self.hypers["long_range"],
                 self.num_features,
-                int(self.hypers["num_radial"]),
                 int(self.hypers["num_spherical_features"]),
+                int(self.hypers["max_degree"]),
                 self.max_degree_lr,
                 self.requested_nl,
             )
         else:
             self.long_range = False
-            self.long_range_featurizer = DummyLoremLongRangeFeaturizer()
+            self.lr = DummyLoremLongRangeFeaturizer()
 
         self.outputs: Dict[str, ModelOutput] = {}
         self.readouts = torch.nn.ModuleDict({})
+        self.bec_heads = torch.nn.ModuleDict({})
+        self.bec_targets = []
         self.single_label = Labels.single()
         self.num_properties: Dict[str, Dict[str, int]] = {}
         self.key_labels: Dict[str, Labels] = {}
@@ -109,8 +114,6 @@ class LOREM(ModelInterface[ModelHypers]):
         self.scaler = Scaler(hypers=scaler_hypers, dataset_info=dataset_info)
 
     def _add_output(self, target_name: str, target: TargetInfo) -> None:
-        if not target.is_scalar:
-            raise ValueError("The LOREM architecture can only predict scalars.")
         n_properties = len(target.layout.block().properties)
         self.num_properties[target_name] = {"default": n_properties}
         self.key_labels[target_name] = target.layout.keys
@@ -120,10 +123,34 @@ class LOREM(ModelInterface[ModelHypers]):
         self.property_labels[target_name] = [
             block.properties for block in target.layout.blocks()
         ]
-        self.readouts[target_name] = torch.nn.Linear(self.num_features, n_properties)
         self.outputs[target_name] = ModelOutput(
             unit=target.unit,
             sample_kind="atom",
+            description=target.description,
+        )
+        if target.is_scalar:
+            self.readouts[target_name] = torch.nn.Linear(self.num_features, n_properties)
+            return
+        if (
+            target.is_cartesian
+            and len(target.layout.block().components) == 2
+            and target.sample_kind == "atom"
+        ):
+            if int(self.hypers["max_degree"]) < 2:
+                raise ValueError(
+                    "Cartesian rank-2 targets (Born effective charges) require "
+                    f"max_degree >= 2, got {self.hypers['max_degree']}."
+                )
+            self.bec_targets.append(target_name)
+            self.bec_heads[target_name] = BornEffectiveChargeHead(
+                int(self.hypers["num_spherical_features"]),
+                int(self.hypers["max_degree"]),
+            )
+            return
+        raise ValueError(
+            "The LOREM architecture predicts scalar targets and per-atom "
+            "Cartesian rank-2 tensors (Born effective charges / APT). "
+            f"Unsupported target '{target_name}'."
         )
 
     def requested_neighbor_lists(self) -> List[NeighborListOptions]:
@@ -165,11 +192,11 @@ class LOREM(ModelInterface[ModelHypers]):
                 for name, properties_tmap in self.property_labels.items()
             }
 
-        features, neighbor_distances, spherical_features = self.backbone(systems)
+        features, neighbor_distances, spherical_features = self.sr(systems)
         if self.long_range:
             if self.training:
-                self.long_range_featurizer.use_ewald = True
-            features = self.long_range_featurizer(
+                self.lr.use_ewald = True
+            features = self.lr(
                 systems, features, neighbor_distances, spherical_features
             )
 
@@ -185,6 +212,38 @@ class LOREM(ModelInterface[ModelHypers]):
         samples = Labels(names=["system", "atom"], values=sample_values.to(torch.int32))
 
         return_dict: Dict[str, TensorMap] = {}
+        for bec_name, bec_head in self.bec_heads.items():
+            if bec_name in outputs:
+                apt = apply_acoustic_sum_rule(
+                    bec_head(spherical_features), system_sizes
+                )
+                n_properties = self.num_properties[bec_name]["default"]
+                if n_properties == 1:
+                    atomic_values = apt.unsqueeze(-1)
+                else:
+                    atomic_values = apt.unsqueeze(-1).expand(
+                        -1, -1, -1, n_properties
+                    )
+                atomic_property = TensorMap(
+                    self.key_labels[bec_name],
+                    [
+                        TensorBlock(
+                            values=atomic_values,
+                            samples=samples,
+                            components=self.component_labels[bec_name][0],
+                            properties=self.property_labels[bec_name][0],
+                        )
+                    ],
+                )
+                if selected_atoms is not None:
+                    atomic_property = mts.slice(
+                        atomic_property, axis="samples", selection=selected_atoms
+                    )
+                if outputs[bec_name].sample_kind == "atom":
+                    return_dict[bec_name] = atomic_property
+                else:
+                    return_dict[bec_name] = sum_over_atoms(atomic_property)
+
         # Enumerate ModuleDict so TorchScript can compile (no variable-key
         # indexing, and no ``continue`` inside the unrolled loop).
         for readout_name, readout in self.readouts.items():
@@ -307,7 +366,7 @@ class LOREM(ModelInterface[ModelHypers]):
             dataset_info=model_data["dataset_info"],
         )
         dtype = next(p.dtype for p in model.parameters() if p.is_floating_point())
-        model.to(dtype).load_state_dict(model_state_dict)
+        model.to(dtype).load_state_dict(model_state_dict, strict=False)
         model.additive_models[0].sync_tensor_maps()
         model.scaler.sync_tensor_maps()
 

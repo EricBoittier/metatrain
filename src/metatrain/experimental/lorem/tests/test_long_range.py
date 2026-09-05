@@ -67,6 +67,30 @@ def test_long_range_features(use_ewald):
     model([system, system], outputs)
 
 
+def test_sr_lr_module_scopes():
+    """iris-style param scopes: backbone is ``sr``, long-range is ``lr``."""
+    model = LOREM(_small_lr_hypers(), _energy_dataset_info())
+    names = {name for name, _ in model.named_children()}
+    assert "sr" in names
+    assert "lr" in names
+    assert any(key.startswith("sr.") for key in model.state_dict())
+    assert any(key.startswith("lr.lr_scale") for key in model.state_dict())
+
+
+def test_lr_scale_zero_is_noop():
+    """``lr_scale == 0`` leaves short-range features unchanged (iris warm-start)."""
+    hypers = _small_lr_hypers()
+    hypers["long_range"]["lr_scale_init"] = 0.0
+    model = LOREM(hypers, _energy_dataset_info())
+    model.eval()
+    system = get_system_with_neighbor_lists(
+        _chain_system(), model.requested_neighbor_lists()
+    )
+    features, distances, spherical = model.sr([system])
+    updated = model.lr([system], features, distances, spherical)
+    torch.testing.assert_close(updated, features, atol=1e-5, rtol=1e-5)
+
+
 def test_max_degree_lr_cannot_exceed_max_degree():
     hypers = _small_lr_hypers(max_degree=1, max_degree_lr=2)
     with pytest.raises(ValueError, match="max_degree_lr"):
@@ -131,10 +155,10 @@ def test_spherical_charges_rotate_as_vectors():
     system = get_system_with_neighbor_lists(system, options)
     rotated = get_system_with_neighbor_lists(rotated, options)
 
-    features, _, spherical = model.backbone([system])
-    features_rot, _, spherical_rot = model.backbone([rotated])
-    charges = model.long_range_featurizer.map_charges(features, spherical)
-    charges_rot = model.long_range_featurizer.map_charges(features_rot, spherical_rot)
+    features, _, spherical = model.sr([system])
+    features_rot, _, spherical_rot = model.sr([rotated])
+    charges = model.lr.map_charges(features, spherical)
+    charges_rot = model.lr.map_charges(features_rot, spherical_rot)
 
     # channels: [scalar, Y00, Y1,-1 (y), Y1,0 (z), Y1,+1 (x)]
     dipole = charges[:, 2:5]

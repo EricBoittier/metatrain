@@ -5,6 +5,21 @@ import torch
 from metatomic.torch import NeighborListOptions, System
 
 from .structures import concatenate_structures
+from .tensor_dense import TensorDense
+
+
+def _degree_norms(spherical: torch.Tensor, max_degree: int) -> torch.Tensor:
+    """Per-ℓ, per-feature norms with the LOREM ``(2ℓ+1)^{1/4}`` factor.
+
+    :param spherical: ``(n_atoms, (max_degree+1)**2, n_features)``
+    :return: ``(n_atoms, (max_degree+1) * n_features)``
+    """
+    parts: List[torch.Tensor] = []
+    for ell in range(max_degree + 1):
+        chunk = spherical[:, ell * ell : (ell + 1) * (ell + 1), :]
+        factor = (2.0 * float(ell) + 1.0) ** 0.25
+        parts.append(factor * _safe_vector_norm(chunk, dim=1))
+    return torch.cat(parts, dim=-1)
 
 
 def _cosine_cutoff(r: torch.Tensor, cutoff: float, width: float) -> torch.Tensor:
@@ -119,6 +134,7 @@ class LoremBackbone(torch.nn.Module):
         self.max_degree = int(hypers["max_degree"])
         self.num_radial = int(hypers["num_radial"])
         self.num_features = int(hypers["num_features"])
+        self.num_spherical_features = int(hypers["num_spherical_features"])
         self.num_message_passing = int(hypers["num_message_passing"])
         self.n_lm = (self.max_degree + 1) * (self.max_degree + 1)
         self.n_invariants = self.num_radial * (self.max_degree + 1)
@@ -143,6 +159,28 @@ class LoremBackbone(torch.nn.Module):
                 for _ in range(self.num_message_passing)
             ]
         )
+
+        # e3x.nn.TensorDense on the aggregated spherical density.
+        self.tensor_dense = TensorDense(
+            in_features=self.num_radial,
+            out_features=self.num_spherical_features,
+            in_max_degree=self.max_degree,
+            out_max_degree=self.max_degree,
+            include_pseudotensors=False,
+        )
+        n_norm = (self.max_degree + 1) * self.num_spherical_features
+        self.norm_update = torch.nn.Sequential(
+            torch.nn.Linear(n_norm, 2 * self.num_features),
+            torch.nn.SiLU(),
+            torch.nn.Linear(2 * self.num_features, self.num_features),
+        )
+        self.norm_after_density = torch.nn.LayerNorm(self.num_features)
+        self.residual_after_density = torch.nn.Sequential(
+            torch.nn.Linear(self.num_features, 2 * self.num_features),
+            torch.nn.SiLU(),
+            torch.nn.Linear(2 * self.num_features, self.num_features),
+        )
+        self.norm_after_residual = torch.nn.LayerNorm(self.num_features)
 
         if self.max_degree > 2:
             try:
@@ -185,8 +223,8 @@ class LoremBackbone(torch.nn.Module):
         :param systems: Batch of systems with the requested neighbor list attached.
         :return: ``(features, neighbor_distances, spherical_features)`` where
             ``features`` is ``(n_atoms_total, num_features)`` and
-            ``spherical_features`` is the neighbor density as
-            ``(n_atoms_total, (max_degree + 1) ** 2, num_radial)``.
+            ``spherical_features`` is the CG-mixed neighbor density as
+            ``(n_atoms_total, (max_degree + 1) ** 2, num_spherical_features)``.
         """
         (
             positions,
@@ -234,8 +272,14 @@ class LoremBackbone(torch.nn.Module):
             density_flat.index_add_(0, centers, edge_density)
         density = density_flat.view(n_atoms, self.num_radial, self.n_lm)
         invariants = self._invariant_density(density)
-        spherical_features = density.transpose(1, 2)
+        spherical_features = self.tensor_dense(density.transpose(1, 2))
         features = self.feature_mlp(torch.cat([features, invariants], dim=-1))
+        features = features + self.norm_update(
+            _degree_norms(spherical_features, self.max_degree)
+        )
+        features = self.norm_after_density(features)
+        features = features + self.residual_after_density(features)
+        features = self.norm_after_residual(features)
 
         for layer in self.mp_layers:
             messages = layer(

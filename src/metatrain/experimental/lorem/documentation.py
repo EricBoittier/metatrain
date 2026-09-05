@@ -24,11 +24,11 @@ That is the paper's equivariant long-range message: Ewald summation over each
 
 .. note::
 
-   This experimental port predicts **scalar** targets (typically energy, with
-   forces via autograd). Spherical charges use a per-:math:`\\ell` linear map
-   (weights shared across :math:`m`). The ``lorem-jax`` Clebsch-Gordan
-   self-product (``e3x.nn.TensorDense``) and Born-effective-charge
-   (``LoremBEC``) heads are not yet implemented.
+   Scalar targets (typically energy, forces via autograd) and per-atom
+   Cartesian rank-2 targets (Born effective charges / APT, the
+   ``lorem.LoremBEC`` head) are supported. Spherical charges use the
+   Clebsch-Gordan self-product (``TensorDense``, the ``e3x.nn.TensorDense``
+   port). ``max_degree >= 2`` is required for BEC.
 
 {{SECTION_INSTALLATION}}
 
@@ -88,6 +88,11 @@ class LoremLongRangeHypers(LongRangeHypers):
     use_ewald: bool = True
     """Use Ewald summation for periodic systems during training. If False,
     P3M is used instead."""
+    lr_scale_init: float = 1.0
+    """Initial value of the learnable ``lr_scale`` that multiplies the
+    long-range residual (iris PETLR). ``1.0`` trains the long-range branch
+    from scratch; set ``0.0`` for a zero perturbation when warm-starting
+    the short-range trunk."""
 
 
 class ModelHypers(TypedDict):
@@ -109,8 +114,9 @@ class ModelHypers(TypedDict):
     num_features: int = 128
     """Dimension of invariant atom features and of the energy readout."""
     num_spherical_features: int = 8
-    """Number of channels in the long-range spherical charge pathway, after a
-    per-:math:`\\ell` linear projection of the short-range radial density."""
+    """Feature width of the Clebsch-Gordan ``TensorDense`` self-product on
+    the short-range spherical density, and of the long-range charge /
+    potential mix."""
     num_radial: int = 32
     """Number of Bessel radial basis functions."""
     num_message_passing: int = 0
