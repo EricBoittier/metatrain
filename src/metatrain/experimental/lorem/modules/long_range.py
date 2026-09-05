@@ -119,7 +119,9 @@ class LoremLongRangeFeaturizer(torch.nn.Module):
             out_max_degree=self.max_degree_lr,
             include_pseudotensors=False,
         )
-        self.potential_to_features = torch.nn.Linear(1, num_spherical_features, bias=False)
+        self.potential_to_features = torch.nn.Linear(
+            1, num_spherical_features, bias=False
+        )
         self.potential_product = TensorProduct(
             left_max_degree=self.max_degree_lr,
             right_max_degree=self.max_degree,
@@ -133,7 +135,9 @@ class LoremLongRangeFeaturizer(torch.nn.Module):
             torch.nn.SiLU(),
             torch.nn.Linear(2 * feature_dim, feature_dim),
         )
-        lr_scale_init = float(hypers["lr_scale_init"]) if "lr_scale_init" in hypers else 1.0
+        extras: dict = dict(hypers)
+        raw_lr_scale = extras.get("lr_scale_init", 1.0)
+        lr_scale_init = float(raw_lr_scale) if raw_lr_scale is not None else 1.0
         self.lr_scale = torch.nn.Parameter(torch.tensor([lr_scale_init]))
         self.update_residual = torch.nn.Sequential(
             torch.nn.Linear(feature_dim, 2 * feature_dim),
@@ -250,7 +254,9 @@ class LoremLongRangeFeaturizer(torch.nn.Module):
     ) -> torch.Tensor:
         """CG-mix potentials into spherical features, then take degree norms."""
         scalar_potential = potentials[:, 0:1]
-        spherical_potential = self.potential_to_features(potentials[:, 1:].unsqueeze(-1))
+        spherical_potential = self.potential_to_features(
+            potentials[:, 1:].unsqueeze(-1)
+        )
         mixed = self.potential_product(spherical_potential, spherical_features)
         norms = _degree_norms(mixed, self.max_degree)
         return torch.cat([scalar_potential, norms], dim=-1)

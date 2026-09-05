@@ -25,8 +25,7 @@ class BornEffectiveChargeHead(torch.nn.Module):
         super().__init__()
         if in_max_degree < 2:
             raise ValueError(
-                "Born effective charges require max_degree >= 2 "
-                f"(got {in_max_degree})."
+                f"Born effective charges require max_degree >= 2 (got {in_max_degree})."
             )
         self.in_max_degree = int(in_max_degree)
         self.hidden = torch.nn.Sequential(
@@ -68,9 +67,7 @@ class BornEffectiveChargeHead(torch.nn.Module):
         )
 
 
-def apply_acoustic_sum_rule(
-    apt: torch.Tensor, system_sizes: List[int]
-) -> torch.Tensor:
+def apply_acoustic_sum_rule(apt: torch.Tensor, system_sizes: List[int]) -> torch.Tensor:
     """Subtract the per-structure mean 3×3 so each system is charge-neutral.
 
     :param apt: ``(n_atoms, 3, 3)``

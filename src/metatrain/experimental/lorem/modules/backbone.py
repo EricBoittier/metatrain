@@ -262,7 +262,9 @@ class LoremBackbone(torch.nn.Module):
         invariants = self._invariant_density(density)
         spherical_features = self.tensor_dense(density.transpose(1, 2))
         features = self.feature_mlp(torch.cat([features, invariants], dim=-1))
-        features = features + self.norm_update(_degree_norms(spherical_features, self.max_degree))
+        features = features + self.norm_update(
+            _degree_norms(spherical_features, self.max_degree)
+        )
         features = self.norm_after_density(features)
         features = features + self.residual_after_density(features)
         features = self.norm_after_residual(features)

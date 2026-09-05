@@ -129,7 +129,9 @@ class LOREM(ModelInterface[ModelHypers]):
             description=target.description,
         )
         if target.is_scalar:
-            self.readouts[target_name] = torch.nn.Linear(self.num_features, n_properties)
+            self.readouts[target_name] = torch.nn.Linear(
+                self.num_features, n_properties
+            )
             return
         if (
             target.is_cartesian
@@ -221,9 +223,7 @@ class LOREM(ModelInterface[ModelHypers]):
                 if n_properties == 1:
                     atomic_values = apt.unsqueeze(-1)
                 else:
-                    atomic_values = apt.unsqueeze(-1).expand(
-                        -1, -1, -1, n_properties
-                    )
+                    atomic_values = apt.unsqueeze(-1).expand(-1, -1, -1, n_properties)
                 atomic_property = TensorMap(
                     self.key_labels[bec_name],
                     [
