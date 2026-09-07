@@ -137,7 +137,11 @@ class ModelHypers(TypedDict):
     pet: dict = {}
     """Optional overrides merged into default PET model hypers when
     ``trunk`` is ``pet`` (``d_pet``, ``num_gnn_layers``, …). ``d_node``
-    is always set to ``num_features``."""
+    is set to ``num_features`` when training from scratch. ``pretrained``
+    may be a PET checkpoint path or Hugging Face URL; that initializes
+    the short-range ``PETBackend`` (heads and LOREM long-range stay
+    random). Checkpoint PET dimensions are kept, and a linear map sends
+    ``d_node`` to ``num_features`` when they differ."""
     num_message_passing: int = 0
     """Number of additional scalar message-passing layers after the spherical
     density. The paper default is 0 (descriptor + long-range only)."""

@@ -1,5 +1,7 @@
 """Bernstein / e3x SH, flax transfer, PET trunk, jax-pme tiling helpers."""
 
+from copy import deepcopy
+
 import torch
 
 from metatrain.experimental.lorem import LOREM
@@ -113,6 +115,43 @@ def test_pet_trunk_forward_shapes():
     assert features.shape[1] == 8
     assert spherical.shape == (4, 4, int(hypers["num_spherical_features"]))
     assert distances.ndim == 1
+
+
+def test_pet_trunk_pretrained_short_range(tmp_path):
+    from metatrain.pet import PET
+    from metatrain.utils.architectures import get_default_hypers
+
+    dataset_info = _energy_dataset_info()
+    pet_hypers = deepcopy(get_default_hypers("pet")["model"])
+    pet_hypers["cutoff"] = 3.0
+    pet_hypers["d_pet"] = 8
+    pet_hypers["d_node"] = 8
+    pet_hypers["d_head"] = 8
+    pet_hypers["d_feedforward"] = 8
+    pet_hypers["num_heads"] = 1
+    pet_hypers["num_gnn_layers"] = 1
+    pet_hypers["num_attention_layers"] = 1
+    pet_hypers["featurizer_type"] = "feedforward"
+    pet_hypers["long_range"]["enable"] = False
+    pet = PET(pet_hypers, dataset_info)
+    ckpt_path = tmp_path / "pet-sr.ckpt"
+    torch.save(pet.get_checkpoint(), ckpt_path)
+
+    hypers = _small_lr_hypers(max_degree=1, max_degree_lr=0)
+    hypers["trunk"] = "pet"
+    hypers["num_features"] = 8
+    hypers["pet"] = {"pretrained": str(ckpt_path)}
+    hypers["long_range"]["enable"] = False
+    lorem = LOREM(hypers, dataset_info)
+
+    pet_names = dict(pet.named_parameters())
+    lorem_names = dict(lorem.named_parameters())
+    pet_linear = [name for name in pet_names if name.endswith("input_linear.weight")]
+    lorem_linear = [
+        name for name in lorem_names if name.endswith("input_linear.weight")
+    ]
+    assert pet_linear and lorem_linear
+    torch.testing.assert_close(lorem_names[lorem_linear[0]], pet_names[pet_linear[0]])
 
 
 def test_bernstein_default_is_paper_basis():
