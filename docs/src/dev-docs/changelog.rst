@@ -36,6 +36,13 @@ Added
   metatomic export. Long-range features use spherical charges up to
   ``max_degree_lr`` evaluated with torch-pme, matching the paper's
   equivariant Ewald-message mechanism.
+- ``experimental.lorem`` now includes the paper Clebsch-Gordan
+  ``TensorDense`` self-product, the ``LoremBEC`` per-atom 3×3 APT head
+  (acoustic sum rule), iris-style ``sr`` / ``lr`` module scopes, and a
+  learnable ``lr_scale`` (``long_range.lr_scale_init``).
+- ``experimental.lorem`` paper-contract tests (default hypers, degree-norm
+  factor, cosine cutoff, charge layout, ``1 ⊗ 1 → 0`` CG identity) and a
+  README section that states what parity is and is not claimed.
 
 Changed
 #######

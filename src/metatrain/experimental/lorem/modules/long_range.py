@@ -6,21 +6,16 @@ from metatomic.torch import System
 from metatrain.utils.long_range import LongRangeHypers
 from metatrain.utils.neighbor_lists import NeighborListOptions
 
+from .tensor_dense import TensorDense, TensorProduct
 
-def _spherical_norm(values: torch.Tensor, max_degree: int) -> torch.Tensor:
-    """Per-degree spherical norm with the LOREM :math:`(2\\ell+1)^{1/4}` factor.
 
-    :param values: Tensor of shape ``(n_atoms, (max_degree + 1) ** 2)``.
-    :param max_degree: Maximum angular momentum.
-    :return: Tensor of shape ``(n_atoms, max_degree + 1)``.
-    """
+def _degree_norms(spherical: torch.Tensor, max_degree: int) -> torch.Tensor:
+    """Per-ℓ, per-feature norms with the LOREM :math:`(2\\ell+1)^{1/4}` factor."""
     parts: List[torch.Tensor] = []
     for ell in range(max_degree + 1):
-        start = ell * ell
-        end = (ell + 1) * (ell + 1)
-        chunk = values[:, start:end]
+        chunk = spherical[:, ell * ell : (ell + 1) * (ell + 1), :]
         factor = (2.0 * float(ell) + 1.0) ** 0.25
-        parts.append(factor * torch.linalg.vector_norm(chunk, dim=-1, keepdim=True))
+        parts.append(factor * torch.linalg.vector_norm(chunk, dim=1))
     return torch.cat(parts, dim=-1)
 
 
@@ -30,6 +25,7 @@ class DummyLoremLongRangeFeaturizer(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.use_ewald = True
+        self.lr_scale = torch.nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -44,23 +40,19 @@ class DummyLoremLongRangeFeaturizer(torch.nn.Module):
 class LoremLongRangeFeaturizer(torch.nn.Module):
     """Ewald / P3M / direct Coulomb features from equivariant atomic charges.
 
-    Scalar features are mapped to one charge channel. Spherical node features
-    are mapped, independently per :math:`\\ell` with weights shared across
-    :math:`m`, to charges up to ``max_degree_lr``. Those channels are evaluated
-    with torch-pme (the paper's long-range message) and contracted back to
-    invariant feature updates.
-
-    This is the Phase-2 mechanism from LOREM / ``lorem-jax``. A Clebsch-Gordan
-    self-product of spherical features (``e3x.nn.TensorDense``) is still a
-    later refinement.
+    Scalar features map to one charge channel. Spherical node features go
+    through ``TensorDense`` (the ``e3x.nn.TensorDense`` self-product) down to
+    ``max_degree_lr``. Those channels are evaluated with torch-pme and mixed
+    back with a CG ``TensorProduct``, matching ``lorem-jax``. ``lr_scale``
+    (iris PETLR) gates the residual so a warm start is a zero perturbation.
     """
 
     def __init__(
         self,
         hypers: LongRangeHypers,
         feature_dim: int,
-        num_radial: int,
         num_spherical_features: int,
+        max_degree: int,
         max_degree_lr: int,
         neighbor_list_options: NeighborListOptions,
     ) -> None:
@@ -81,9 +73,9 @@ class LoremLongRangeFeaturizer(torch.nn.Module):
                 "Please install it with `pip install 'torch-pme>=0.3.2'`."
             ) from None
 
+        self.max_degree = int(max_degree)
         self.max_degree_lr = int(max_degree_lr)
         self.n_lm_lr = (self.max_degree_lr + 1) * (self.max_degree_lr + 1)
-        self.num_radial = int(num_radial)
         self.num_spherical_features = int(num_spherical_features)
         self.feature_dim = int(feature_dim)
         self.use_ewald = bool(hypers["use_ewald"])
@@ -120,27 +112,33 @@ class LoremLongRangeFeaturizer(torch.nn.Module):
             torch.nn.SiLU(),
             torch.nn.Linear(2 * feature_dim, 1),
         )
-        # Per-ℓ maps, weights shared across m (equivariant linear). The first
-        # layer projects the radial density onto ``num_spherical_features``.
-        self.spherical_projections = torch.nn.ModuleList(
-            [
-                torch.nn.Linear(num_radial, num_spherical_features, bias=False)
-                for _ in range(self.max_degree_lr + 1)
-            ]
+        self.spherical_charge_dense = TensorDense(
+            in_features=num_spherical_features,
+            out_features=1,
+            in_max_degree=self.max_degree,
+            out_max_degree=self.max_degree_lr,
+            include_pseudotensors=False,
         )
-        self.spherical_charge_maps = torch.nn.ModuleList(
-            [
-                torch.nn.Linear(num_spherical_features, 1, bias=False)
-                for _ in range(self.max_degree_lr + 1)
-            ]
+        self.potential_to_features = torch.nn.Linear(
+            1, num_spherical_features, bias=False
+        )
+        self.potential_product = TensorProduct(
+            left_max_degree=self.max_degree_lr,
+            right_max_degree=self.max_degree,
+            out_max_degree=self.max_degree,
+            include_pseudotensors=False,
         )
 
-        n_update = 1 + (self.max_degree_lr + 1) * (1 + num_spherical_features)
+        n_update = 1 + (self.max_degree + 1) * num_spherical_features
         self.update_from_potential = torch.nn.Sequential(
             torch.nn.Linear(n_update, 2 * feature_dim),
             torch.nn.SiLU(),
             torch.nn.Linear(2 * feature_dim, feature_dim),
         )
+        extras: dict = dict(hypers)
+        raw_lr_scale = extras.get("lr_scale_init", 1.0)
+        lr_scale_init = float(raw_lr_scale) if raw_lr_scale is not None else 1.0
+        self.lr_scale = torch.nn.Parameter(torch.tensor([lr_scale_init]))
         self.update_residual = torch.nn.Sequential(
             torch.nn.Linear(feature_dim, 2 * feature_dim),
             torch.nn.SiLU(),
@@ -149,41 +147,20 @@ class LoremLongRangeFeaturizer(torch.nn.Module):
         self.norm_after_potential = torch.nn.LayerNorm(feature_dim)
         self.norm_after_residual = torch.nn.LayerNorm(feature_dim)
 
-    def project_spherical(self, spherical_features: torch.Tensor) -> torch.Tensor:
-        """Project radial density channels onto ``num_spherical_features``.
-
-        :param spherical_features: Neighbor density
-            ``(n_atoms, n_lm, num_radial)``.
-        :return: ``(n_atoms, (max_degree_lr + 1) ** 2, num_spherical_features)``.
-        """
-        parts: List[torch.Tensor] = []
-        for ell, projection in enumerate(self.spherical_projections):
-            start = ell * ell
-            end = (ell + 1) * (ell + 1)
-            parts.append(projection(spherical_features[:, start:end, :]))
-        return torch.cat(parts, dim=1)
-
     def map_charges(
         self, features: torch.Tensor, spherical_features: torch.Tensor
     ) -> torch.Tensor:
         """Map scalar and spherical features to concatenated charge channels.
 
         :param features: Invariant atom features ``(n_atoms, feature_dim)``.
-        :param spherical_features: Neighbor density
-            ``(n_atoms, n_lm, num_radial)`` with
-            ``n_lm >= (max_degree_lr + 1) ** 2``.
+        :param spherical_features: CG-mixed neighbor density
+            ``(n_atoms, n_lm, num_spherical_features)``.
         :return: Charges ``(n_atoms, 1 + (max_degree_lr + 1) ** 2)`` — the
             leading channel is the scalar charge, the rest are spherical
             charges ordered ``ℓ = 0..max_degree_lr``, ``m = -ℓ..ℓ``.
         """
         scalar_charges = self.scalar_charge_mlp(features)
-        projected = self.project_spherical(spherical_features)
-        spherical_parts: List[torch.Tensor] = []
-        for ell, charge_map in enumerate(self.spherical_charge_maps):
-            start = ell * ell
-            end = (ell + 1) * (ell + 1)
-            spherical_parts.append(charge_map(projected[:, start:end, :]).squeeze(-1))
-        spherical_charges = torch.cat(spherical_parts, dim=-1)
+        spherical_charges = self.spherical_charge_dense(spherical_features)[:, :, 0]
         return torch.cat([scalar_charges, spherical_charges], dim=-1)
 
     def _potentials_for_system(
@@ -275,18 +252,14 @@ class LoremLongRangeFeaturizer(torch.nn.Module):
     def _invariant_updates(
         self, potentials: torch.Tensor, spherical_features: torch.Tensor
     ) -> torch.Tensor:
-        """Contract equivariant potentials to rotation-invariant updates."""
+        """CG-mix potentials into spherical features, then take degree norms."""
         scalar_potential = potentials[:, 0:1]
-        spherical_potential = potentials[:, 1:]
-        parts: List[torch.Tensor] = [scalar_potential]
-        parts.append(_spherical_norm(spherical_potential, self.max_degree_lr))
-        for ell in range(self.max_degree_lr + 1):
-            start = ell * ell
-            end = (ell + 1) * (ell + 1)
-            v_ell = spherical_potential[:, start:end]
-            s_ell = spherical_features[:, start:end, :]
-            parts.append(torch.einsum("nm,nmf->nf", v_ell, s_ell))
-        return torch.cat(parts, dim=-1)
+        spherical_potential = self.potential_to_features(
+            potentials[:, 1:].unsqueeze(-1)
+        )
+        mixed = self.potential_product(spherical_potential, spherical_features)
+        norms = _degree_norms(mixed, self.max_degree)
+        return torch.cat([scalar_potential, norms], dim=-1)
 
     def forward(
         self,
@@ -303,11 +276,12 @@ class LoremLongRangeFeaturizer(torch.nn.Module):
         :param spherical_features: Short-range spherical features.
         :return: Updates of shape ``(n_atoms, feature_dim)``.
         """
+        original = features
         charges = self.map_charges(features, spherical_features)
         potentials = self._evaluate_potentials(systems, charges, neighbor_distances)
-        projected = self.project_spherical(spherical_features)
-        updates = self._invariant_updates(potentials, projected)
+        updates = self._invariant_updates(potentials, spherical_features)
         features = features + self.update_from_potential(updates)
         features = self.norm_after_potential(features)
         features = features + self.update_residual(features)
-        return self.norm_after_residual(features)
+        features = self.norm_after_residual(features)
+        return original + self.lr_scale * (features - original)
