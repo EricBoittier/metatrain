@@ -122,7 +122,26 @@ class ModelHypers(TypedDict):
     the short-range spherical density, and of the long-range charge /
     potential mix."""
     num_radial: int = 32
-    """Number of Bessel radial basis functions."""
+    """Number of radial basis functions (Bernstein or Bessel)."""
+    radial_basis: Literal["bessel", "basic_bernstein"] = "basic_bernstein"
+    """Radial expansion on neighbor distances. ``basic_bernstein`` is the
+    e3x / lorem-jax default; ``bessel`` is the original sinc basis."""
+    sh_convention: Literal["orthonormal", "e3x"] = "e3x"
+    """Spherical-harmonic normalization. ``e3x`` is Racah / Schmidt
+    (lorem-jax); ``orthonormal`` is 4π-normalized (sphericart). Both use
+    ``m = -ℓ … +ℓ`` so Clebsch–Gordan is unchanged."""
+    trunk: Literal["spherical", "pet"] = "spherical"
+    """Short-range trunk. ``spherical`` is the paper descriptor.
+    ``pet`` mounts metatrain ``PETBackend`` as ``sr`` (iris PETLR) and
+    keeps a spherical sidecar for equivariant charges / BEC."""
+    pet: dict = {}
+    """Optional overrides merged into default PET model hypers when
+    ``trunk`` is ``pet`` (``d_pet``, ``num_gnn_layers``, …). ``d_node``
+    is set to ``num_features`` when training from scratch. ``pretrained``
+    may be a PET checkpoint path or Hugging Face URL; that initializes
+    the short-range ``PETBackend`` (heads and LOREM long-range stay
+    random). Checkpoint PET dimensions are kept, and a linear map sends
+    ``d_node`` to ``num_features`` when they differ."""
     num_message_passing: int = 0
     """Number of additional scalar message-passing layers after the spherical
     density. The paper default is 0 (descriptor + long-range only)."""

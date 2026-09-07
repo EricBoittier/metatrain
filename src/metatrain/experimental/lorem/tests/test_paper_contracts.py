@@ -33,6 +33,79 @@ from metatrain.utils.architectures import get_default_hypers
 
 from . import MODEL_HYPERS
 
+# Defaults copied from lorem-jax ``src/lorem/models/mlip.py`` class ``Lorem``.
+# CI does not import JAX; keep this table in sync by hand.
+LOREM_JAX_LOREM_DEFAULTS = {
+    "cutoff": 5.0,
+    "max_degree": 6,
+    "max_degree_lr": 2,
+    "num_features": 128,
+    "num_radial": 32,
+    "num_species": 8,
+    "num_spherical_features": 8,
+    "cutoff_fn": "cosine_cutoff",
+    "radial_basis": "basic_bernstein",
+    "lr": True,
+    "num_message_passing": 0,
+    "equivariant_message_passing": True,
+    "initialize_node_features": True,
+}
+
+# Same names and meaning on both sides.
+SHARED_HYPER_KEYS = (
+    "cutoff",
+    "max_degree",
+    "max_degree_lr",
+    "num_features",
+    "num_radial",
+    "num_spherical_features",
+    "radial_basis",
+    "num_message_passing",
+)
+
+# lorem-jax name → experimental.lorem path (same role, different spelling).
+RENAMED_HYPER_KEYS = {
+    "lr": "long_range.enable",
+    "cutoff_fn": "cutoff_width (cosine envelope; onset = cutoff - width)",
+}
+
+# iris.pet.PETLR (cousin: PET trunk + scalar charges, not the paper descriptor).
+IRIS_PETLR_KEYS = (
+    "d_pet",
+    "d_node",
+    "d_head",
+    "d_feedforward",
+    "num_heads",
+    "num_attention_layers",
+    "num_gnn_layers",
+    "cutoff",
+    "cutoff_width",
+    "lr",
+    "num_charges",
+    "lr_scale_init",
+)
+
+
+def _nested_keys(tree, prefix=""):
+    keys = []
+    if not isinstance(tree, dict):
+        return keys
+    for key, value in tree.items():
+        name = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            keys.extend(_nested_keys(value, name))
+        else:
+            keys.append(name)
+    return keys
+
+
+def _print_table(title, rows):
+    print(f"\n{title}")
+    print("-" * len(title))
+    width = max(len(row[0]) for row in rows)
+    for left, right in rows:
+        print(f"  {left:<{width}}  {right}")
+
 
 def test_default_hypers_match_paper():
     """Paper / ``documentation.py`` defaults (lorem-jax ``Lorem`` knobs)."""
@@ -45,7 +118,103 @@ def test_default_hypers_match_paper():
     assert hypers["num_radial"] == 32
     assert hypers["num_spherical_features"] == 8
     assert hypers["num_message_passing"] == 0
+    assert hypers["radial_basis"] == "basic_bernstein"
+    assert hypers["sh_convention"] == "e3x"
+    assert hypers["trunk"] == "spherical"
     assert hypers["long_range"]["enable"] is True
+
+
+def test_hypers_keys_overlap_lorem_jax():
+    """Print the two param dicts. Shared knobs must exist and match defaults."""
+    hypers = get_default_hypers("experimental.lorem")["model"]
+    torch_keys = set(_nested_keys(hypers))
+    jax_keys = set(LOREM_JAX_LOREM_DEFAULTS)
+
+    _print_table(
+        "lorem-jax Lorem fields (params dict keys / defaults)",
+        [(key, repr(value)) for key, value in LOREM_JAX_LOREM_DEFAULTS.items()],
+    )
+    _print_table(
+        "experimental.lorem model hypers (params dict keys / defaults)",
+        [
+            (
+                key,
+                repr(hypers[key]) if not isinstance(hypers[key], dict) else "{...}",
+            )
+            for key in hypers
+        ],
+    )
+    _print_table(
+        "nested experimental.lorem keys",
+        [(key, "") for key in sorted(torch_keys)],
+    )
+
+    rows = []
+    for key in SHARED_HYPER_KEYS:
+        jax_value = LOREM_JAX_LOREM_DEFAULTS[key]
+        torch_value = hypers[key]
+        mark = "match" if jax_value == torch_value else "DIFF"
+        rows.append((key, f"jax={jax_value!r}  torch={torch_value!r}  [{mark}]"))
+    rows.append(
+        (
+            "lr / long_range.enable",
+            f"jax={LOREM_JAX_LOREM_DEFAULTS['lr']!r}  "
+            f"torch={hypers['long_range']['enable']!r}  [match]",
+        )
+    )
+    _print_table("shared architecture knobs", rows)
+
+    jax_only = sorted(jax_keys - set(SHARED_HYPER_KEYS) - {"lr"})
+    _print_table(
+        "lorem-jax-only knobs (role covered, different name or inferred)",
+        [(key, RENAMED_HYPER_KEYS.get(key, "see README")) for key in jax_only],
+    )
+    _print_table(
+        "iris PETLR keys (cousin; not the paper LOREM dict)",
+        [(key, "") for key in IRIS_PETLR_KEYS],
+    )
+
+    missing = [key for key in SHARED_HYPER_KEYS if key not in hypers]
+    assert missing == [], f"experimental.lorem missing lorem-jax knobs: {missing}"
+    for key in SHARED_HYPER_KEYS:
+        assert hypers[key] == LOREM_JAX_LOREM_DEFAULTS[key], key
+    assert hypers["long_range"]["enable"] is LOREM_JAX_LOREM_DEFAULTS["lr"]
+
+
+def test_torch_param_keys_follow_sr_lr_scopes():
+    """Print named_parameters keys. ``sr`` / ``lr`` match iris PETLR scopes."""
+    pytest.importorskip("torchpme")
+
+    from metatrain.experimental.lorem import LOREM
+
+    from .test_long_range import _energy_dataset_info, _small_lr_hypers
+
+    model = LOREM(
+        _small_lr_hypers(max_degree=1, max_degree_lr=1),
+        _energy_dataset_info(),
+    )
+    names = [name for name, _ in model.named_parameters()]
+    prefixes = sorted({name.split(".")[0] for name in names})
+    _print_table(
+        "experimental.lorem top-level param scopes",
+        [
+            (
+                prefix,
+                f"{sum(n.startswith(prefix + '.') or n == prefix for n in names)} "
+                "leaves",
+            )
+            for prefix in prefixes
+        ],
+    )
+    _print_table(
+        "experimental.lorem named_parameters keys",
+        [(name, str(tuple(param.shape))) for name, param in model.named_parameters()],
+    )
+    assert "sr" in prefixes
+    assert "lr" in prefixes
+    assert any(name.startswith("lr.scalar_charge_mlp") for name in names)
+    assert any(name.startswith("lr.spherical_charge_dense") for name in names)
+    assert "lr.lr_scale" in names
 
 
 def test_degree_norm_factor_is_two_ell_plus_one_to_the_quarter():
