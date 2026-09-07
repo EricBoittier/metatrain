@@ -325,6 +325,10 @@ class Trainer(TrainerInterface[TrainerHypers]):
             # if there are no new targets in the model (new parameters)
             if not raw_model.has_new_targets:
                 optimizer.load_state_dict(self.optimizer_state_dict)
+                # YAML ``learning_rate`` wins on restart (loaded Adam state
+                # would otherwise keep the previous run's lr).
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = self.hypers["learning_rate"]
 
         # Create a scheduler:
         use_cosine_schedule = self.hypers["scheduler"] == "cosine"
@@ -420,6 +424,11 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 train_loss_batch = loss_fn(predictions, targets, extra_data)
 
                 train_loss_batch.backward()
+                # Isolated atoms (empty neighbor lists) can yield NaN second-order
+                # grads through the CG ``TensorDense`` path when training forces.
+                for param in model.parameters():
+                    if param.grad is not None:
+                        param.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
                 optimizer.step()
                 if use_cosine_schedule:
                     lr_scheduler.step()

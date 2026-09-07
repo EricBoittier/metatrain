@@ -49,7 +49,7 @@ class TestOutput(OutputTests, LoremTests):
     supports_spherical_outputs = False
     supports_spherical_rank2_outputs = False
     supports_spherical_atomic_basis_outputs = False
-    supports_vector_outputs = False
+    supports_vector_outputs = True
     supports_features = False
     supports_last_layer_features = False
 

@@ -107,6 +107,8 @@ class LOREM(ModelInterface[ModelHypers]):
         self.readouts = torch.nn.ModuleDict({})
         self.bec_heads = torch.nn.ModuleDict({})
         self.bec_targets = []
+        self.dipole_heads = torch.nn.ModuleDict({})
+        self.dipole_targets = []
         self.single_label = Labels.single()
         self.num_properties: Dict[str, Dict[str, int]] = {}
         self.key_labels: Dict[str, Labels] = {}
@@ -143,6 +145,17 @@ class LOREM(ModelInterface[ModelHypers]):
                 self.num_features, n_properties
             )
             return
+        if target.is_cartesian and len(target.layout.block().components) == 1:
+            self.outputs[target_name] = ModelOutput(
+                unit=target.unit,
+                sample_kind=target.sample_kind,
+                description=target.description,
+            )
+            self.dipole_targets.append(target_name)
+            self.dipole_heads[target_name] = torch.nn.Linear(
+                self.num_features, n_properties
+            )
+            return
         if (
             target.is_cartesian
             and len(target.layout.block().components) == 2
@@ -160,7 +173,8 @@ class LOREM(ModelInterface[ModelHypers]):
             )
             return
         raise ValueError(
-            "The LOREM architecture predicts scalar targets and per-atom "
+            "The LOREM architecture predicts scalar targets, Cartesian "
+            "rank-1 dipoles (PhysNet-style ``q r``), and per-atom "
             "Cartesian rank-2 tensors (Born effective charges / APT). "
             f"Unsupported target '{target_name}'."
         )
@@ -253,6 +267,31 @@ class LOREM(ModelInterface[ModelHypers]):
                     return_dict[bec_name] = atomic_property
                 else:
                     return_dict[bec_name] = sum_over_atoms(atomic_property)
+
+        positions = torch.cat([system.positions for system in systems], dim=0)
+        for dipole_name, charge_readout in self.dipole_heads.items():
+            if dipole_name in outputs:
+                charges = charge_readout(features)
+                atomic_values = positions.unsqueeze(-1) * charges.unsqueeze(1)
+                atomic_property = TensorMap(
+                    self.key_labels[dipole_name],
+                    [
+                        TensorBlock(
+                            values=atomic_values,
+                            samples=samples,
+                            components=self.component_labels[dipole_name][0],
+                            properties=self.property_labels[dipole_name][0],
+                        )
+                    ],
+                )
+                if selected_atoms is not None:
+                    atomic_property = mts.slice(
+                        atomic_property, axis="samples", selection=selected_atoms
+                    )
+                if outputs[dipole_name].sample_kind == "atom":
+                    return_dict[dipole_name] = atomic_property
+                else:
+                    return_dict[dipole_name] = sum_over_atoms(atomic_property)
 
         # Enumerate ModuleDict so TorchScript can compile (no variable-key
         # indexing, and no ``continue`` inside the unrolled loop).

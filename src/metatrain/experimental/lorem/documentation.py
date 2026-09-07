@@ -24,15 +24,20 @@ That is the paper's equivariant long-range message: Ewald summation over each
 
 .. note::
 
-   Scalar targets (typically energy, forces via autograd) and per-atom
-   Cartesian rank-2 targets (Born effective charges / APT, the
+   Scalar targets (typically energy, forces and stress via autograd),
+   Cartesian rank-1 dipoles (PhysNet-style :math:`\\mu = \\sum_i q_i r_i`)
+   and per-atom Cartesian rank-2 targets (Born effective charges / APT, the
    ``lorem.LoremBEC`` head) are supported. Spherical charges use the
    Clebsch-Gordan self-product (``TensorDense``, the ``e3x.nn.TensorDense``
    port). ``max_degree >= 2`` is required for BEC.
 
    This is a metatrain-native port: same equations and knobs as the paper /
-   lorem-jax, not a bit-exact JAX clone. Developer comparison notes and the
-   in-repo contract tests live in the architecture ``README.md``.
+   lorem-jax, not a bit-exact JAX clone. A separate private torch
+   inference port with JAX numerical parity is
+   `fahrenheit-dev <https://github.com/sirmarcel/fahrenheit-dev>`_; that
+   is not this architecture. Developer comparison notes (including the
+   fahrenheit package layout vs. these modules) and the in-repo contract
+   tests live in the architecture ``README.md``.
 
 {{SECTION_INSTALLATION}}
 
