@@ -1,0 +1,16 @@
+systems:
+  read_from: data/sn2-subset.xyz
+  length_unit: angstrom
+
+targets:
+  energy:
+    key: energy
+    unit: eV
+  mtt::dipole:
+    key: dipole_moment
+    quantity: ""
+    unit: e*A
+    sample_kind: system
+    type:
+      cartesian:
+        rank: 1

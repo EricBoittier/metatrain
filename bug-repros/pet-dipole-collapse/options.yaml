@@ -1,0 +1,50 @@
+# Minimal reproduction for: PET's rank-1 Cartesian (dipole) head collapses
+# to a near-constant output during training. See ../README.md.
+#
+#   mtt train options.yaml
+#   python check_correlation.py
+
+seed: 42
+
+architecture:
+  name: pet
+  model:
+    cutoff: 5.0
+    cutoff_width: 0.5
+    d_pet: 32
+    d_head: 32
+    d_node: 64
+    d_feedforward: 64
+    num_heads: 2
+    num_attention_layers: 1
+    num_gnn_layers: 1
+    long_range:
+      enable: false
+  training:
+    num_epochs: 30
+    batch_size: 16
+    learning_rate: 0.0001
+    log_interval: 5
+    scale_targets: true
+
+training_set:
+  systems:
+    read_from: data/sn2-subset.xyz
+    length_unit: angstrom
+  targets:
+    energy:
+      key: energy
+      unit: eV
+      forces:
+        key: forces
+    mtt::dipole:
+      key: dipole_moment
+      quantity: ""
+      unit: e*A
+      sample_kind: system
+      type:
+        cartesian:
+          rank: 1
+
+test_set: 0.1
+validation_set: 0.1
