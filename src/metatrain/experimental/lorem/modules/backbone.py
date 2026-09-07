@@ -27,6 +27,18 @@ def _bessel_basis(r: torch.Tensor, n_radial: int, cutoff: float) -> torch.Tensor
     return math.sqrt(2.0 / cutoff) * torch.sin(n * math.pi * r_safe / cutoff) / r_safe
 
 
+def _safe_vector_norm(x: torch.Tensor, dim: int, eps: float = 1.0e-12) -> torch.Tensor:
+    """``torch.linalg.vector_norm`` with a finite gradient at zero.
+
+    ``vector_norm``'s backward is ``x / ||x||``, which is ``0/0 = nan`` whenever
+    ``x`` is exactly zero along ``dim`` -- e.g. a vanishing ``m``-component of a
+    spherical harmonic. Adding ``eps`` inside the square root keeps the value
+    (and gradient) finite everywhere without materially changing it away from
+    zero.
+    """
+    return torch.sqrt(x.pow(2).sum(dim=dim) + eps)
+
+
 def _real_spherical_harmonics(vectors: torch.Tensor, l_max: int) -> torch.Tensor:
     """Real orthonormal spherical harmonics for ``l_max <= 2``.
 
@@ -162,7 +174,7 @@ class LoremBackbone(torch.nn.Module):
             if ell == 0:
                 parts.append(chunk.squeeze(-1))
             else:
-                parts.append(torch.linalg.vector_norm(chunk, dim=-1))
+                parts.append(_safe_vector_norm(chunk, dim=-1))
         return torch.cat(parts, dim=-1)
 
     def forward(

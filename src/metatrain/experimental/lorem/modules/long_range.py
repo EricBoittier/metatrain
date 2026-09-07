@@ -7,6 +7,20 @@ from metatrain.utils.long_range import LongRangeHypers
 from metatrain.utils.neighbor_lists import NeighborListOptions
 
 
+def _safe_vector_norm(
+    x: torch.Tensor, dim: int, keepdim: bool = False, eps: float = 1.0e-12
+) -> torch.Tensor:
+    """``torch.linalg.vector_norm`` with a finite gradient at zero.
+
+    ``vector_norm``'s backward is ``x / ||x||``, which is ``0/0 = nan`` whenever
+    ``x`` is exactly zero along ``dim`` -- e.g. a vanishing ``m``-component of a
+    spherical harmonic. Adding ``eps`` inside the square root keeps the value
+    (and gradient) finite everywhere without materially changing it away from
+    zero.
+    """
+    return torch.sqrt(x.pow(2).sum(dim=dim, keepdim=keepdim) + eps)
+
+
 def _spherical_norm(values: torch.Tensor, max_degree: int) -> torch.Tensor:
     """Per-degree spherical norm with the LOREM :math:`(2\\ell+1)^{1/4}` factor.
 
@@ -20,7 +34,7 @@ def _spherical_norm(values: torch.Tensor, max_degree: int) -> torch.Tensor:
         end = (ell + 1) * (ell + 1)
         chunk = values[:, start:end]
         factor = (2.0 * float(ell) + 1.0) ** 0.25
-        parts.append(factor * torch.linalg.vector_norm(chunk, dim=-1, keepdim=True))
+        parts.append(factor * _safe_vector_norm(chunk, dim=-1, keepdim=True))
     return torch.cat(parts, dim=-1)
 
 
