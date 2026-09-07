@@ -155,10 +155,20 @@ class TrainerHypers(TypedDict):
     learning_rate: float = 0.001
     """Learning rate."""
 
+    scheduler: str = "plateau"
+    """Learning-rate schedule: ``"plateau"`` (``ReduceLROnPlateau``, driven by
+    ``scheduler_patience``/``scheduler_factor``) or ``"cosine"`` (linear warmup
+    then cosine decay over the full run, driven by ``warmup_fraction`` -- the
+    same schedule PET and SOAP-BPNN use, for apples-to-apples comparisons)."""
     scheduler_patience: int = 100
-    """Number of epochs with no improvement before reducing the learning rate."""
+    """Number of epochs with no improvement before reducing the learning rate.
+    Only used when ``scheduler`` is ``"plateau"``."""
     scheduler_factor: float = 0.8
-    """Factor by which the learning rate is reduced on plateau."""
+    """Factor by which the learning rate is reduced on plateau. Only used when
+    ``scheduler`` is ``"plateau"``."""
+    warmup_fraction: float = 0.01
+    """Fraction of total optimizer steps spent on linear warmup before the
+    cosine decay begins. Only used when ``scheduler`` is ``"cosine"``."""
 
     log_interval: int = 1
     """Interval to log metrics."""

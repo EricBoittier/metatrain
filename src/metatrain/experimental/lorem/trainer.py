@@ -1,10 +1,12 @@
 import copy
 import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Union
 
 import torch
 import torch.distributed
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DistributedSampler
 
 from metatrain.composition import train_or_load_composition_model
@@ -53,6 +55,35 @@ from .model import LOREM
 
 # Learning rate below which training is stopped early.
 _MIN_LEARNING_RATE = 1e-7
+
+
+def _get_cosine_scheduler(
+    optimizer: torch.optim.Optimizer,
+    train_hypers: Dict[str, Any],
+    steps_per_epoch: int,
+) -> LambdaLR:
+    """Linear warmup then cosine decay over the full run.
+
+    Same schedule (and same ``warmup_fraction`` hyperparameter) as PET and
+    SOAP-BPNN use, so ``scheduler: cosine`` gives LOREM an identical
+    learning-rate trajectory for apples-to-apples comparisons.
+
+    :param optimizer: The optimizer for which to create the scheduler.
+    :param train_hypers: The training hyperparameters.
+    :param steps_per_epoch: The number of optimizer steps per epoch.
+    """
+    total_steps = train_hypers["num_epochs"] * steps_per_epoch
+    warmup_steps = int(train_hypers["warmup_fraction"] * total_steps)
+
+    def lr_lambda(current_step: int) -> float:
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = (current_step - warmup_steps) / float(
+            max(1, total_steps - warmup_steps)
+        )
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
 def _get_raw_model(model: Union[LOREM, DistributedDataParallel], is_distributed: bool):
@@ -296,13 +327,19 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 optimizer.load_state_dict(self.optimizer_state_dict)
 
         # Create a scheduler:
-        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            factor=self.hypers["scheduler_factor"],
-            patience=self.hypers["scheduler_patience"],
-            threshold=0.001,
-            min_lr=1e-5,
-        )
+        use_cosine_schedule = self.hypers["scheduler"] == "cosine"
+        if use_cosine_schedule:
+            lr_scheduler: torch.optim.lr_scheduler.LRScheduler = _get_cosine_scheduler(
+                optimizer, self.hypers, len(train_dataloader)
+            )
+        else:
+            lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                factor=self.hypers["scheduler_factor"],
+                patience=self.hypers["scheduler_patience"],
+                threshold=0.001,
+                min_lr=1e-5,
+            )
         if self.scheduler_state_dict is not None:
             # same as the optimizer, try to load the scheduler state dict
             if not raw_model.has_new_targets:
@@ -384,6 +421,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
                 train_loss_batch.backward()
                 optimizer.step()
+                if use_cosine_schedule:
+                    lr_scheduler.step()
 
                 if is_distributed:
                     # sum the loss over all processes
@@ -524,27 +563,34 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     metrics=[finalized_train_info, finalized_val_info],
                     epoch=epoch,
                     rank=rank,
+                    learning_rate=optimizer.param_groups[0]["lr"],
                 )
 
-            lr_scheduler.step(val_loss)
-            new_lr = lr_scheduler.get_last_lr()[0]
-            if new_lr != old_lr:
-                if new_lr < _MIN_LEARNING_RATE:
-                    logging.info("Learning rate is too small, stopping training")
-                    break
-                else:
-                    logging.info(f"Changing learning rate from {old_lr} to {new_lr}")
-                    old_lr = new_lr
-                    # load best model and optimizer state dict, re-initialize scheduler
-                    raw_model.load_state_dict(self.best_model_state_dict)
-                    optimizer.load_state_dict(self.best_optimizer_state_dict)
-                    for param_group in optimizer.param_groups:
-                        param_group["lr"] = new_lr
-                    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                        optimizer,
-                        factor=self.hypers["scheduler_factor"],
-                        patience=self.hypers["scheduler_patience"],
-                    )
+            if use_cosine_schedule:
+                # Already stepped once per batch above; the cosine schedule
+                # has no plateau/reload-on-change concept, same as PET and
+                # SOAP-BPNN.
+                old_lr = lr_scheduler.get_last_lr()[0]
+            else:
+                lr_scheduler.step(val_loss)
+                new_lr = lr_scheduler.get_last_lr()[0]
+                if new_lr != old_lr:
+                    if new_lr < _MIN_LEARNING_RATE:
+                        logging.info("Learning rate is too small, stopping training")
+                        break
+                    else:
+                        logging.info(f"Changing learning rate from {old_lr} to {new_lr}")
+                        old_lr = new_lr
+                        # load best model/optimizer state, re-initialize scheduler
+                        raw_model.load_state_dict(self.best_model_state_dict)
+                        optimizer.load_state_dict(self.best_optimizer_state_dict)
+                        for param_group in optimizer.param_groups:
+                            param_group["lr"] = new_lr
+                        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                            optimizer,
+                            factor=self.hypers["scheduler_factor"],
+                            patience=self.hypers["scheduler_patience"],
+                        )
 
             val_metric = get_selected_metric(
                 finalized_val_info, self.hypers["best_model_metric"]
