@@ -140,9 +140,15 @@ class LoremBackbone(torch.nn.Module):
                     "sphericart-torch is required for LOREM with max_degree > 2. "
                     "Install it with `pip install metatrain[lorem]`."
                 ) from err
-            self.spherical_harmonics = _SphericartWrapper(
-                SphericalHarmonics(l_max=self.max_degree, normalized=True)
-            )
+            # sphericart >= 0.5 dropped ``normalized`` and is an nn.Module.
+            try:
+                calculator = SphericalHarmonics(l_max=self.max_degree, normalized=True)
+            except TypeError:
+                calculator = SphericalHarmonics(l_max=self.max_degree)
+            if isinstance(calculator, torch.nn.Module):
+                self.spherical_harmonics = calculator
+            else:
+                self.spherical_harmonics = _SphericartWrapper(calculator)
         else:
             self.spherical_harmonics = _AnalyticSphericalHarmonics(self.max_degree)
 

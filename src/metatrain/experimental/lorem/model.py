@@ -21,6 +21,7 @@ from metatrain.utils.data import TargetInfo
 from metatrain.utils.data.atom_pair_helpers import check_no_atom_pair_targets
 from metatrain.utils.data.dataset import DatasetInfo
 from metatrain.utils.dtype import dtype_to_str
+from metatrain.utils.hypers import raise_if_hypers_mismatch
 from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.sum_over_atoms import sum_over_atoms
 
@@ -235,7 +236,18 @@ class LOREM(ModelInterface[ModelHypers]):
 
         return return_dict
 
-    def restart(self, dataset_info: DatasetInfo) -> "LOREM":
+    def restart(
+        self,
+        dataset_info: DatasetInfo,
+        model_hypers: Optional[Dict[str, Any]] = None,
+    ) -> "LOREM":
+        if model_hypers is not None:
+            raise_if_hypers_mismatch(
+                self.hypers,
+                model_hypers,
+                default_hypers=get_default_hypers("experimental.lorem")["model"],
+            )
+
         merged_info = self.dataset_info.union(dataset_info)
         new_atomic_types = [
             at for at in merged_info.atomic_types if at not in self.atomic_types
