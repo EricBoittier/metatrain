@@ -141,6 +141,7 @@ class LoremLongRangeFeaturizer(torch.nn.Module):
             right_max_degree=self.max_degree,
             out_max_degree=self.max_degree,
             include_pseudotensors=False,
+            n_features=num_spherical_features,
         )
 
         n_update = 1 + (self.max_degree + 1) * num_spherical_features
