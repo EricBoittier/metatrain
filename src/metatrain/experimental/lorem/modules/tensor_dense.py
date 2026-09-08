@@ -246,3 +246,73 @@ class TensorProduct(_CGProduct):
     def forward(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
         """``left`` / ``right`` are ``(n_atoms, n_lm_*, n_features)``."""
         return self._couple(left, right)
+
+
+class EquivariantMessagePass(torch.nn.Module):
+    """Port of one lorem-jax equivariant message-passing step.
+
+    lorem-jax's ``num_message_passing`` loop updates both scalar *and*
+    spherical node features each iteration. The spherical half is::
+
+        messages[i] = sum_(j in N(i)) tensor(nodes_spherical[j], filter(edges_basis[ij]))
+        nodes_spherical = tensor_combine(dense_x(nodes_spherical), dense_m(messages))
+
+    (``e3x.nn.MessagePass`` for the first line, ``e3x.nn.Dense`` +
+    ``e3x.nn.Tensor`` for the second). ``filter`` and both ``dense_*`` are
+    :class:`_DegreeWiseLinear`; the two couplings are separate
+    :class:`TensorProduct` instances (each with its own learnable
+    ``tensor_weight`` -- e3x gives ``MessagePass`` and the combine step
+    independent kernels).
+    """
+
+    def __init__(
+        self, num_features: int, max_degree: int, include_pseudotensors: bool = False
+    ) -> None:
+        super().__init__()
+        self.max_degree = int(max_degree)
+        self.filter = _DegreeWiseLinear(
+            num_features, num_features, self.max_degree, bias=False
+        )
+        self.message_tensor = TensorProduct(
+            self.max_degree, self.max_degree, self.max_degree,
+            include_pseudotensors=include_pseudotensors, n_features=num_features,
+        )
+        self.combine_dense_x = _DegreeWiseLinear(
+            num_features, num_features, self.max_degree, bias=False
+        )
+        self.combine_dense_m = _DegreeWiseLinear(
+            num_features, num_features, self.max_degree, bias=False
+        )
+        self.combine_tensor = TensorProduct(
+            self.max_degree, self.max_degree, self.max_degree,
+            include_pseudotensors=include_pseudotensors, n_features=num_features,
+        )
+
+    def forward(
+        self,
+        nodes_spherical: torch.Tensor,
+        edges_basis: torch.Tensor,
+        centers: torch.Tensor,
+        neighbors: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        :param nodes_spherical: ``(n_atoms, n_lm, F)`` current spherical features.
+        :param edges_basis: ``(n_edges, n_lm, F)`` per-edge spherical "basis"
+            to filter (e.g. edge-coefficients times spherical harmonics).
+        :param centers: ``(n_edges,)`` destination atom index (``i``).
+        :param neighbors: ``(n_edges,)`` source atom index (``j``).
+        :return: ``(n_atoms, n_lm, F)`` updated spherical features.
+        """
+        n_atoms = nodes_spherical.shape[0]
+        filtered = self.filter(edges_basis)
+        gathered = nodes_spherical[neighbors]
+        products = self.message_tensor(gathered, filtered)
+        messages = nodes_spherical.new_zeros(
+            (n_atoms, products.shape[1], products.shape[2])
+        )
+        if products.shape[0] > 0:
+            messages.index_add_(0, centers, products)
+        return self.combine_tensor(
+            self.combine_dense_x(nodes_spherical),
+            self.combine_dense_m(messages),
+        )

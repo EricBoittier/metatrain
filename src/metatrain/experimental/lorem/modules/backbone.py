@@ -7,7 +7,7 @@ from metatomic.torch import NeighborListOptions, System
 from .radial import bernstein_basis, bessel_basis, binomial_row
 from .spherical import to_racah
 from .structures import concatenate_structures
-from .tensor_dense import TensorDense
+from .tensor_dense import EquivariantMessagePass, TensorDense
 
 
 def _degree_norms(spherical: torch.Tensor, max_degree: int) -> torch.Tensor:
@@ -170,6 +170,31 @@ class LoremBackbone(torch.nn.Module):
                 for _ in range(self.num_message_passing)
             ]
         )
+        # lorem-jax updates the equivariant (spherical) node features at every
+        # message-passing step too, not just the scalar ones -- see
+        # `EquivariantMessagePass`'s docstring. `equivariant_mp_edge_coefficients`
+        # builds each step's per-edge spherical "basis" (edges_scalar -> per
+        # degree coefficients, broadcast onto that edge's spherical harmonics,
+        # matching lorem-jax's `RadialCoefficients`-derived `edges_spherical`).
+        self.equivariant_mp_edge_coefficients = torch.nn.ModuleList(
+            [
+                torch.nn.Linear(
+                    2 * self.num_features,
+                    (self.max_degree + 1) * self.num_spherical_features,
+                    bias=False,
+                )
+                for _ in range(self.num_message_passing)
+            ]
+        )
+        self.equivariant_mp_layers = torch.nn.ModuleList(
+            [
+                EquivariantMessagePass(
+                    self.num_spherical_features, self.max_degree,
+                    include_pseudotensors=False,
+                )
+                for _ in range(self.num_message_passing)
+            ]
+        )
 
         # e3x.nn.TensorDense on the aggregated spherical density.
         self.tensor_dense = TensorDense(
@@ -184,6 +209,21 @@ class LoremBackbone(torch.nn.Module):
             torch.nn.Linear(n_norm, 2 * self.num_features),
             torch.nn.SiLU(),
             torch.nn.Linear(2 * self.num_features, self.num_features),
+        )
+        # lorem-jax folds each message-passing step's updated spherical
+        # features back into the scalar ones via their degree-norms (a fresh
+        # Update MLP per step, same shape as `norm_update` above) -- without
+        # this the equivariant update has no path to the energy at all (dead
+        # computation, zero gradient).
+        self.equivariant_mp_norm_update = torch.nn.ModuleList(
+            [
+                torch.nn.Sequential(
+                    torch.nn.Linear(n_norm, 2 * self.num_features),
+                    torch.nn.SiLU(),
+                    torch.nn.Linear(2 * self.num_features, self.num_features),
+                )
+                for _ in range(self.num_message_passing)
+            ]
         )
         self.norm_after_density = torch.nn.LayerNorm(self.num_features)
         self.residual_after_density = torch.nn.Sequential(
@@ -297,14 +337,42 @@ class LoremBackbone(torch.nn.Module):
         features = features + self.residual_after_density(features)
         features = self.norm_after_residual(features)
 
-        for layer in self.mp_layers:
-            messages = layer(
-                torch.cat([features[centers], features[neighbors]], dim=-1)
-            )
+        for layer, edge_coefficients, equivariant_layer, equivariant_norm_update in zip(
+            self.mp_layers,
+            self.equivariant_mp_edge_coefficients,
+            self.equivariant_mp_layers,
+            self.equivariant_mp_norm_update,
+        ):
+            edge_features = torch.cat([features[centers], features[neighbors]], dim=-1)
+            messages = layer(edge_features)
             messages = messages * cutoff_weights.unsqueeze(-1)
             update = torch.zeros_like(features)
             if messages.shape[0] > 0:
                 update.index_add_(0, centers, messages)
             features = features + update
+
+            # Equivariant update: lorem-jax refines the spherical node
+            # features at every message-passing step too (see
+            # EquivariantMessagePass). Build this step's per-edge spherical
+            # "basis" from a fresh scalar-edge -> per-degree-coefficient
+            # projection, broadcast onto that edge's spherical harmonics.
+            coefficients = edge_coefficients(edge_features).reshape(
+                distances.shape[0], self.max_degree + 1, self.num_spherical_features
+            )
+            edge_parts: List[torch.Tensor] = []
+            for ell in range(self.max_degree + 1):
+                start = ell * ell
+                end = (ell + 1) * (ell + 1)
+                edge_parts.append(
+                    coefficients[:, ell : ell + 1, :] * sh[:, start:end].unsqueeze(-1)
+                )
+            edges_spherical = torch.cat(edge_parts, dim=1)
+            edges_spherical = edges_spherical * cutoff_weights.unsqueeze(-1).unsqueeze(-1)
+            spherical_features = equivariant_layer(
+                spherical_features, edges_spherical, centers, neighbors
+            )
+            features = features + equivariant_norm_update(
+                _degree_norms(spherical_features, self.max_degree)
+            )
 
         return features, distances, spherical_features
