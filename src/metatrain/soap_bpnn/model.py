@@ -209,6 +209,7 @@ class SoapBpnn(ModelInterface[ModelHypers]):
     component_labels: Dict[str, List[List[Labels]]]  # torchscript needs this
     cartesian_rank1_targets: List[str]  # torchscript needs this
     cartesian_rank2_targets: List[str]  # torchscript needs this
+    charge_dipole_targets: List[str]  # torchscript needs this
 
     def __init__(self, hypers: ModelHypers, dataset_info: DatasetInfo) -> None:
         super().__init__(hypers, dataset_info, self.__default_metadata__)
@@ -377,6 +378,7 @@ class SoapBpnn(ModelInterface[ModelHypers]):
         self.last_layer_parameter_names: Dict[str, List[str]] = {}  # for LLPR
         self.cartesian_rank1_targets: List[str] = []
         self.cartesian_rank2_targets: List[str] = []
+        self.charge_dipole_targets: List[str] = []
         for target_name, target in train_dataset_info.targets.items():
             self._add_output(target_name, target)
 
@@ -706,17 +708,22 @@ class SoapBpnn(ModelInterface[ModelHypers]):
                 features_by_output[base_name], outputs[output_name].sample_kind
             )
 
+        # Cumulative per-system atom offsets, used to turn a (system, atom) sample
+        # pair into a flat index into the batch-concatenated `positions` tensor.
+        # Computed unconditionally (cheap) since the charge-based dipole heads
+        # need it regardless of the legacy/modern SOAP-BPNN flavor.
+        system_offsets = torch.cat(
+            [
+                torch.tensor([0], device=device),
+                torch.cumsum(system_sizes_tensor, dim=0)[:-1],
+            ]
+        )
+
         # Pre-compute sorting indices for legacy keys_to_samples (shared across
         # all outputs since the per-species block structure is identical).
         legacy_sorting_indices = torch.tensor(0, device=device)
         legacy_sorted_samples = torch.tensor(0, device=device)
         if self.legacy:
-            system_offsets = torch.cat(
-                [
-                    torch.tensor([0], device=device),
-                    torch.cumsum(system_sizes_tensor, dim=0)[:-1],
-                ]
-            )
             all_samples = torch.concatenate(
                 [b.samples.values for b in features.blocks()]
             )
@@ -751,25 +758,42 @@ class SoapBpnn(ModelInterface[ModelHypers]):
                             legacy_sorted_samples,
                         )
                     tensor_basis = torch.tensor(0)
-                    for (
-                        output_name_basis,
-                        basis_calculators_by_block,
-                    ) in self.basis_calculators.items():
-                        # need to loop again and do this due to torchscript
-                        if output_name_basis == output_name:
-                            for (
-                                basis_calculator_key,
-                                basis_calculator,
-                            ) in basis_calculators_by_block.items():
-                                if basis_calculator_key == layer_key:
-                                    tensor_basis = basis_calculator(
-                                        interatomic_vectors,
-                                        centers,
-                                        neighbors,
-                                        species,
-                                        sample_values,
-                                        selected_atoms,
-                                    )
+                    if output_name in self.charge_dipole_targets:
+                        # charge-based dipole head: the "basis" is just each
+                        # atom's own position, not a learned/computed vector.
+                        # The last layer's single output per property is then
+                        # the atom's charge, and the einsum below contracts it
+                        # with the position to give mu_i = q_i * r_i. Gather
+                        # positions via the (system, atom) sample labels rather
+                        # than relying on batch order, since `invariant_coefficients`
+                        # may have been reordered (legacy per-species layout) and/or
+                        # restricted to `selected_atoms`.
+                        dipole_samples = invariant_coefficients.block().samples.values
+                        flat_atom_index = (
+                            system_offsets[dipole_samples[:, 0].to(torch.long)]
+                            + dipole_samples[:, 1].to(torch.long)
+                        )
+                        tensor_basis = positions[flat_atom_index].unsqueeze(-1)
+                    else:
+                        for (
+                            output_name_basis,
+                            basis_calculators_by_block,
+                        ) in self.basis_calculators.items():
+                            # need to loop again and do this due to torchscript
+                            if output_name_basis == output_name:
+                                for (
+                                    basis_calculator_key,
+                                    basis_calculator,
+                                ) in basis_calculators_by_block.items():
+                                    if basis_calculator_key == layer_key:
+                                        tensor_basis = basis_calculator(
+                                            interatomic_vectors,
+                                            centers,
+                                            neighbors,
+                                            species,
+                                            sample_values,
+                                            selected_atoms,
+                                        )
                     # multiply the invariant coefficients by the elements of the
                     # tensor basis
                     invariant_coefficients_tensor = (
@@ -803,9 +827,12 @@ class SoapBpnn(ModelInterface[ModelHypers]):
                     self.key_labels[output_name], blocks
                 )
 
-        # Convert spherical predictions back to Cartesian basis (per-atom)
+        # Convert spherical predictions back to Cartesian basis (per-atom).
+        # Charge-based dipole targets are already Cartesian (mu_i = q_i * r_i
+        # was built directly from atomic positions, not a spherical basis), so
+        # they must skip this conversion.
         for name in self.cartesian_rank1_targets:
-            if name in atomic_properties:
+            if name in atomic_properties and name not in self.charge_dipole_targets:
                 atomic_properties[name] = _to_cartesian_rank_1(atomic_properties[name])
         for name in self.cartesian_rank2_targets:
             if name in atomic_properties:
@@ -1081,17 +1108,18 @@ class SoapBpnn(ModelInterface[ModelHypers]):
         elif target.is_cartesian:
             n_cart_components = len(target.layout.block().components)
             if n_cart_components == 1:
-                # rank-1: hard-code to spherical (o3_lambda=1, o3_sigma=1)
+                # rank-1: predict a per-atom scalar "charge" and multiply by that
+                # atom's position (mu = sum_i q_i * r_i), the same PhysNet-style
+                # inductive bias used by the LOREM and PET dipole heads. This is
+                # more data-efficient than a learned, position-agnostic vector
+                # basis: the model only has to learn a scalar per atom, and the
+                # geometry (which makes the output rotate correctly) comes for
+                # free from the atom's actual position rather than from a
+                # separately-learned SOAP-derived vector. No TensorBasis/CG
+                # machinery is needed for this target -- see the charge_dipole_
+                # targets branch in forward().
                 self.cartesian_rank1_targets.append(target_name)
-                dict_key = target_name + "___0"
-                self.basis_calculators[target_name][dict_key] = TensorBasis(
-                    self.atomic_types,
-                    self.hypers["soap"],
-                    1,
-                    1,
-                    self.hypers["add_lambda_basis"],
-                    self.legacy,
-                )
+                self.charge_dipole_targets.append(target_name)
             elif n_cart_components == 2:
                 # rank-2: predict as 3 spherical components (l=0,1,2)
                 self.cartesian_rank2_targets.append(target_name)
@@ -1195,10 +1223,13 @@ class SoapBpnn(ModelInterface[ModelHypers]):
                 dict_key += f"_{n}_{int(k)}"
             # the spherical tensor basis is made of 2*l+1 tensors, same as the number
             # of components. The lambda basis adds a further 2*l+1 tensors, but only
-            # if lambda > 1
+            # if lambda > 1. Charge-based dipole targets are the exception: the
+            # last layer only needs to predict a single scalar "charge" per atom
+            # per property, which then gets multiplied by that atom's position
+            # (a fixed geometric quantity, not a learned basis vector).
             basis_size = (
                 1
-                if target.is_scalar
+                if (target.is_scalar or target_name in self.charge_dipole_targets)
                 else (
                     len(block.components[0])
                     if (len(block.components[0]) == 1 or len(block.components[0]) == 3)
