@@ -13,6 +13,10 @@ from metatrain.utils.io import (
     model_from_checkpoint,
     trainer_from_checkpoint,
 )
+from metatrain.utils.testing._utils import (
+    download_hf_checkpoint_or_skip,
+    is_huggingface_rate_limit,
+)
 
 
 @pytest.fixture(scope="module", params=["pathlib", "str", "file_url"])
@@ -184,3 +188,25 @@ def test_load_model_token_invalid_url_style():
         match=f"URL '{path}' has an invalid format for the Hugging Face Hub.",
     ):
         load_model(path, hf_token=hf_token)
+
+
+def test_is_huggingface_rate_limit():
+    rate_limited = OSError("HTTP Error 429: Too Many Requests")
+    rate_limited.status_code = 429
+    assert is_huggingface_rate_limit(rate_limited)
+    assert is_huggingface_rate_limit(OSError("Too Many Requests"))
+    assert not is_huggingface_rate_limit(ValueError("invalid checkpoint"))
+
+
+def test_download_hf_checkpoint_skips_on_429(monkeypatch):
+    def boom(*args, **kwargs):
+        err = OSError("HTTP Error 429: Too Many Requests")
+        err.status_code = 429
+        raise err
+
+    monkeypatch.setattr(
+        "metatrain.utils.testing._utils.download_model_from_hf",
+        boom,
+    )
+    with pytest.raises(pytest.skip.Exception, match="rate-limited"):
+        download_hf_checkpoint_or_skip("lab-cosmo/upet", "models/missing.ckpt")

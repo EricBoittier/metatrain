@@ -1,6 +1,5 @@
 import shutil
 import subprocess
-import urllib.request
 from pathlib import Path
 
 import ase.io
@@ -10,6 +9,8 @@ import torch
 from ase.md import VelocityVerlet
 from metatomic.torch import ModelOutput
 from metatomic_ase import MetatomicCalculator
+
+from metatrain.utils.testing._utils import download_hf_checkpoint_or_skip
 
 
 HERE = Path(__file__).parent
@@ -70,8 +71,12 @@ def test_with_old_llpr_checkpoint(monkeypatch, tmp_path):
     shutil.copy(HERE / "options-pet-ft.yaml", "options-pet-ft.yaml")
 
     # 1. Get the PET-MAD model checkpoint (v1.0.2):
-    url = "https://huggingface.co/lab-cosmo/pet-mad/resolve/v1.0.2/models/pet-mad-v1.0.2.ckpt"
-    urllib.request.urlretrieve(url, "model-llpr.ckpt")
+    path = download_hf_checkpoint_or_skip(
+        repo_id="lab-cosmo/pet-mad",
+        filename="models/pet-mad-v1.0.2.ckpt",
+        revision="v1.0.2",
+    )
+    shutil.copy(path, "model-llpr.ckpt")
 
     # 2. Check that the LLPR model exported from the checkpoint works as intended
     command = ["mtt", "export", "model-llpr.ckpt"]
