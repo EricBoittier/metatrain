@@ -77,7 +77,7 @@ def _load_tensor_weight(
     _, l1_list, l2_list, L_list = _build_couplings(
         l1_max, l2_max, out_max, include_pseudotensors=False
     )
-    for index, (l1, l2, L) in enumerate(zip(l1_list, l2_list, L_list)):
+    for index, (l1, l2, L) in enumerate(zip(l1_list, l2_list, L_list, strict=True)):
         value = grid[l1, l2, L] * cg_phase_correction(l1, l2, L)
         module.tensor_weight.data[index].copy_(value)
 
@@ -106,7 +106,9 @@ def _load_update(module: torch.nn.Module, flax: Mapping[str, Any], prefix: str) 
     module.norm1.bias.data.copy_(_t(flax, f"{prefix}/LayerNorm_1/bias"))
 
 
-def _load_mlp(module: torch.nn.Sequential, flax: Mapping[str, Any], prefix: str) -> None:
+def _load_mlp(
+    module: torch.nn.Sequential, flax: Mapping[str, Any], prefix: str
+) -> None:
     """3-layer ``MLP(features=[d, d, 1])`` (``MLP_0`` / ``MLP_2``)."""
     module[0].weight.data.copy_(_t(flax, f"{prefix}/Dense_0/kernel").transpose(0, 1))
     module[0].bias.data.copy_(_t(flax, f"{prefix}/Dense_0/bias"))
@@ -116,7 +118,9 @@ def _load_mlp(module: torch.nn.Sequential, flax: Mapping[str, Any], prefix: str)
     module[4].bias.data.copy_(_t(flax, f"{prefix}/Dense_2/bias"))
 
 
-def _load_mlp2(module: torch.nn.Sequential, flax: Mapping[str, Any], prefix: str) -> None:
+def _load_mlp2(
+    module: torch.nn.Sequential, flax: Mapping[str, Any], prefix: str
+) -> None:
     """2-layer ``MLP(features=[2 * d, 1])`` (``MLP_1``, the scalar charge head)."""
     module[0].weight.data.copy_(_t(flax, f"{prefix}/Dense_0/kernel").transpose(0, 1))
     module[0].bias.data.copy_(_t(flax, f"{prefix}/Dense_0/bias"))

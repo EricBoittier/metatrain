@@ -81,7 +81,7 @@ from typing import List, Tuple
 import torch
 from metatomic.torch import NeighborListOptions, System
 
-from .backbone import _AnalyticSphericalHarmonics, _SphericartWrapper, _degree_norms
+from .backbone import _AnalyticSphericalHarmonics, _degree_norms, _SphericartWrapper
 from .radial import bernstein_basis, binomial_row
 from .spherical import to_racah
 from .structures import concatenate_structures

@@ -22,6 +22,7 @@ from metatrain.experimental.lorem.modules.jax_parity_checkpoint import load_chec
 from metatrain.experimental.lorem.modules.tensor_dense import _build_couplings
 from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
 
+
 CUTOFF = 3.0
 MAX_DEGREE = 2
 MAX_DEGREE_LR = 1
@@ -84,11 +85,13 @@ def _dump_degree_wise(module, prefix, max_degree, flax):
 
 def _dump_tensor_weight(module, prefix, l1_max, l2_max, out_max, flax):
     n_channels = module.tensor_weight.shape[-1]
-    grid = torch.zeros(l1_max + 1, l2_max + 1, out_max + 1, n_channels, dtype=torch.float64)
+    grid = torch.zeros(
+        l1_max + 1, l2_max + 1, out_max + 1, n_channels, dtype=torch.float64
+    )
     _, l1_list, l2_list, L_list = _build_couplings(
         l1_max, l2_max, out_max, include_pseudotensors=False
     )
-    for index, (l1, l2, L) in enumerate(zip(l1_list, l2_list, L_list)):
+    for index, (l1, l2, L) in enumerate(zip(l1_list, l2_list, L_list, strict=True)):
         grid[l1, l2, L] = module.tensor_weight.detach()[index] * cg_phase_correction(
             l1, l2, L
         )
@@ -206,6 +209,24 @@ def test_jax_parity_backbone_forward_shapes():
     assert torch.isfinite(sr_energy).all()
 
 
+def test_jax_parity_long_range_has_no_exclusion_radius():
+    """Regression test: lorem-jax's own ``Ewald()`` factory
+    (``jaxpme.batched_mixed.calculators``) always builds its potential with
+    ``exclusion_radius=None`` -- plain, unmodified Ewald. An earlier version
+    of this module set ``exclusion_radius=neighbor_list_options.cutoff``
+    here (copied from the *production* ``LoremLongRangeFeaturizer``, which
+    deliberately restructures that split), and that one wrong argument was
+    the entire source of a large, persistent energy/force discrepancy
+    against real checkpoints that looked like a torch-pme-vs-jax-pme
+    numerics gap but wasn't (see this module's docstring and
+    ``etc/lorem-parity/jax_checkpoint_parity/`` in metawork for the full
+    writeup). Both calculators must keep ``exclusion_radius=None``.
+    """
+    _, long_range = _build_pair(seed=0)
+    assert long_range.ewald_calculator.potential.exclusion_radius is None
+    assert long_range.direct_calculator.potential.exclusion_radius is None
+
+
 def test_jax_parity_long_range_periodic_forward():
     backbone, long_range = _build_pair(seed=1)
     nlo = _nlo()
@@ -251,12 +272,16 @@ def test_jax_parity_checkpoint_loader_round_trips():
     load_checkpoint(target_backbone, target_long_range, flax)
 
     for (name, source_param), (target_name, target_param) in zip(
-        source_backbone.named_parameters(), target_backbone.named_parameters()
+        source_backbone.named_parameters(),
+        target_backbone.named_parameters(),
+        strict=True,
     ):
         assert name == target_name
         torch.testing.assert_close(target_param, source_param, msg=f"backbone.{name}")
     for (name, source_param), (target_name, target_param) in zip(
-        source_long_range.named_parameters(), target_long_range.named_parameters()
+        source_long_range.named_parameters(),
+        target_long_range.named_parameters(),
+        strict=True,
     ):
         assert name == target_name
         torch.testing.assert_close(target_param, source_param, msg=f"long_range.{name}")
