@@ -51,12 +51,28 @@ See :mod:`.jax_parity_checkpoint` for the checkpoint loader, and
 `metawork <https://github.com/EricBoittier/metawork>`_ workspace for a
 worked example (dumping a real ``lorem-tmlr-archive`` checkpoint from JAX,
 loading it here, and comparing energies/forces against the JAX reference).
-On the one checkpoint this has been checked against so far (AuMgO, PBC,
-Ewald), the two agree to ~1e-6 relative on every module up through charge
-generation; the residual ~0.7 meV/atom energy discrepancy on that dataset
-traces to the Ewald long-range potential evaluation itself (``torch-pme`` vs
-``jax-pme``), not to anything in this module -- see the worked example for
-the full breakdown.
+Checked against two real periodic checkpoints (AuMgO, bio_dimers): total
+energy and forces agree with the JAX reference to ~1e-4 relative or better
+(float32 noise floor), matching the paper's own reported test-set accuracy
+on both. An earlier version of this module set the Ewald calculator's
+``exclusion_radius`` to the model's short-range cutoff (copied from the
+*production* ``LoremLongRangeFeaturizer``, which deliberately restructures
+that split); lorem-jax's own ``Ewald()`` factory
+(``jaxpme.batched_mixed.calculators``) always builds its potential with
+``exclusion_radius=None`` -- plain, unmodified Ewald, no short-range
+exclusion zone. That one argument was the entire source of what looked
+like a torch-pme-vs-jax-pme numerics gap (~0.7 meV/atom on AuMgO, much
+larger on bio_dimers) but wasn't -- see the worked example's README for the
+full investigation and how it was found (a from-scratch analytic Madelung
+-constant check proved both libraries individually correct before the real
+cause -- one wrong constructor argument -- turned up).
+
+Ewald ``smearing``/``kspace_resolution`` are *not* read from a checkpoint's
+``model.yaml`` (lorem-jax's own ``marathon.prepare()`` derives them from the
+model's ``cutoff`` at data-prep time: ``smearing = cutoff / 4``,
+``lr_wavelength = cutoff / 8``) -- pass those derived values, not a
+``torchpme.tuning.ewald.tune_ewald`` guess, when reproducing a real
+checkpoint's numbers; the worked example does this.
 """
 
 import math
@@ -324,20 +340,32 @@ class JaxParityLongRange(torch.nn.Module):
         self.max_degree_lr = int(max_degree_lr)
         self.neighbor_list_options = neighbor_list_options
 
+        # lorem-jax's own ``Ewald()`` factory (jaxpme.batched_mixed.calculators)
+        # builds its potential with ``exclusion_radius=None`` -- plain,
+        # unmodified Ewald, no short-range exclusion zone. An earlier version
+        # of this module set ``exclusion_radius=neighbor_list_options.cutoff``
+        # here, copied from the *production* ``LoremLongRangeFeaturizer``
+        # (which deliberately restructures the split, see that class's
+        # docstring) -- for this exact-parity port that was simply wrong, and
+        # was the entire source of a ~0.7 meV/atom energy discrepancy against
+        # a real checkpoint that looked like a torch-pme/jax-pme numerics gap
+        # but wasn't: with ``exclusion_radius=None``, the two potentials
+        # agree to ~1e-5 (float32 noise), not ~30% off.
         self.ewald_calculator = EwaldCalculator(
             potential=CoulombPotential(
                 smearing=float(smearing),
-                exclusion_radius=neighbor_list_options.cutoff,
+                exclusion_radius=None,
             ),
             full_neighbor_list=neighbor_list_options.full_list,
             lr_wavelength=float(kspace_resolution),
         )
         # lorem-jax's non-PBC path: plain pairwise 1/r over *all* pairs (not
-        # restricted to the short-range cutoff neighbor list), no smearing.
+        # restricted to the short-range cutoff neighbor list), no smearing,
+        # no exclusion (same reasoning as ewald_calculator above).
         self.direct_calculator = Calculator(
             potential=CoulombPotential(
                 smearing=None,
-                exclusion_radius=neighbor_list_options.cutoff,
+                exclusion_radius=None,
             ),
             full_neighbor_list=False,
         )

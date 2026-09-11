@@ -219,7 +219,24 @@ Three layers:
    `etc/lorem-parity/` in [metawork](https://github.com/EricBoittier/metawork)
    after `git submodule update --init`. Run `mtt` there; run lorem-jax
    examples in a separate JAX venv.
-3. **This README** — what the five stacks are, and what we do not claim.
+3. **Checkpoint-parity spot check** (optional, not in this repository, no
+   bit-exact claim revised): [`modules/jax_parity.py`](modules/jax_parity.py)
+   is a *separate* module-for-module port of lorem-jax's SR trunk and LR
+   block, kept apart from `LoremBackbone`/`LoremLongRangeFeaturizer` above so
+   it can target exact 1:1 weight loading from a real
+   `lorem-jax` flax checkpoint instead of `experimental.lorem`'s own
+   equations-and-knobs equivalence. Checked against two real periodic
+   [lorem-tmlr-archive](https://github.com/sirmarcel/lorem-tmlr-archive)
+   checkpoints (AuMgO, bio_dimers): total energy and forces agree with the
+   JAX reference to ~1e-4 relative or better (float32 noise floor),
+   matching the paper's own reported test-set accuracy on both. [`jax_parity_checkpoint.py`](modules/jax_parity_checkpoint.py)
+   is the leaf-by-leaf loader (tested against a synthetic checkpoint in
+   [`tests/test_jax_parity.py`](tests/test_jax_parity.py), no JAX needed);
+   `etc/lorem-parity/jax_checkpoint_parity/` in metawork has the worked
+   example against real archive checkpoints, including a warm-started
+   fine-tune that reaches within ~15-20% of the paper's reported accuracy
+   on cumulene from a short training run.
+4. **This README** — what the five stacks are, and what we do not claim.
 
 | Symbol | Test | Source |
 | --- | --- | --- |
@@ -237,6 +254,7 @@ Three layers:
 | `sr` / `lr` scopes | `test_sr_lr_module_scopes` | iris `name="sr"` / `name="lr"` |
 | energy / ℓ=1 rotation | `test_long_range_energy_rotation_invariant`, `test_spherical_charges_rotate_as_vectors` | paper equivariance |
 | `TensorDense` scalars | `test_tensor_dense_scalar_is_rotation_invariant` | e3x `TensorDense` |
+| checkpoint loader round-trips a synthetic checkpoint | `test_jax_parity_checkpoint_loader_round_trips` | `jax_parity_checkpoint.load_checkpoint` |
 
 CI does not import JAX, does not store golden JAX energies, and does not
 treat the two stacks as interchangeable.
