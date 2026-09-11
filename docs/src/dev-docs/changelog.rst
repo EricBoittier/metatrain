@@ -30,6 +30,26 @@ Fixed
 Added
 #####
 
+- Experimental ``experimental.lorem`` architecture: a PyTorch / TorchScript
+  port of LOREM (*Learning Long-Range Representations with Equivariant
+  Messages*, https://arxiv.org/abs/2507.19382) for energy training and
+  metatomic export. Long-range features use spherical charges up to
+  ``max_degree_lr`` evaluated with torch-pme, matching the paper's
+  equivariant Ewald-message mechanism.
+- ``experimental.lorem`` now includes the paper Clebsch-Gordan
+  ``TensorDense`` self-product, the ``LoremBEC`` per-atom 3×3 APT head
+  (acoustic sum rule), iris-style ``sr`` / ``lr`` module scopes, and a
+  learnable ``lr_scale`` (``long_range.lr_scale_init``).
+- ``experimental.lorem`` Cartesian rank-1 dipole head (PhysNet-style
+  :math:`q r` sum, system or per-atom).
+- ``experimental.lorem`` paper-contract tests (default hypers, degree-norm
+  factor, cosine cutoff, charge layout, ``1 ⊗ 1 → 0`` CG identity) and a
+  README section that states what parity is and is not claimed. The
+  contract file also prints the lorem-jax vs torch param-dict keys and
+  the ``sr`` / ``lr`` ``named_parameters`` tree. The README also maps the
+  private ``fahrenheit-dev`` torch inference port onto this package's
+  modules.
+
 Changed
 #######
 
