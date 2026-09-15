@@ -38,7 +38,7 @@ from .modules.pet_trunk import PetTrunk
 
 
 class LOREM(ModelInterface[ModelHypers]):
-    __checkpoint_version__ = 3
+    __checkpoint_version__ = 4
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -428,7 +428,7 @@ class LOREM(ModelInterface[ModelHypers]):
             dataset_info=model_data["dataset_info"],
         )
         dtype = next(p.dtype for p in model.parameters() if p.is_floating_point())
-        model.to(dtype).load_state_dict(model_state_dict, strict=False)
+        model.to(dtype).load_state_dict(model_state_dict)
         model.additive_models[0].sync_tensor_maps()
         model.scaler.sync_tensor_maps()
 
