@@ -233,7 +233,10 @@ def test_degree_norm_factor_is_two_ell_plus_one_to_the_quarter():
             0.0,
         ]
     )
-    torch.testing.assert_close(norms[0], expected, atol=1e-6, rtol=1e-6)
+    # atol=2e-6: the expected-zero l=2 block hits `_safe_vector_norm`'s eps=1e-12
+    # safety term (sqrt(0 + eps) = 1e-6), scaled by that degree's (2*2+1)**0.25
+    # factor -- a deterministic ~1.495e-6 floor, not platform noise.
+    torch.testing.assert_close(norms[0], expected, atol=2e-6, rtol=1e-6)
 
 
 def test_cosine_cutoff_is_one_inside_and_zero_at_cutoff():
