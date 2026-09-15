@@ -249,6 +249,33 @@ def model_update_v8_v9(checkpoint: dict) -> None:
     update_per_property_scales(checkpoint)
 
 
+def model_update_v9_v10(checkpoint: dict) -> None:
+    """
+    Update model checkpoint from version 9 to version 10.
+
+    The ``_extra_state`` format for metatensor ``Module``-based layers
+    (``layernorm``, ``bpnn``, ``last_layers.*``) changed: it previously stored
+    a PyTorch module-like dict (with ``_parameters``, ``_backward_hooks``,
+    ``_forward_hooks``, etc.) but now stores the serialised ``_in_keys``
+    directly as ``{'_in_keys': ...}``.
+
+    Since the old format did not persist ``_in_keys`` in a recoverable way,
+    we reset every old-format ``_extra_state`` to an empty dict so that the
+    model instance's own ``set_extra_state`` (which handles ``{}`` gracefully)
+    populates the keys from the values already set by the constructor. This
+    is the same approach used in ``model_update_v4_v5``.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    for key in ["model_state_dict", "best_model_state_dict"]:
+        if (state_dict := checkpoint.get(key)) is not None:
+            for state_key in list(state_dict.keys()):
+                if state_key.endswith("._extra_state"):
+                    extra_state = state_dict[state_key]
+                    if isinstance(extra_state, dict) and "_parameters" in extra_state:
+                        state_dict[state_key] = {}
+
+
 ###########################
 # TRAINER #################
 ###########################

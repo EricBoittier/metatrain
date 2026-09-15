@@ -72,6 +72,7 @@ class PET(ModelInterface[ModelHypers]):
         references={"architecture": ["https://arxiv.org/abs/2305.19302v3"]}
     )
     component_labels: Dict[str, List[List[Labels]]]
+    dipole_targets: List[str]
     NUM_FEATURE_TYPES: int = 2  # node + edge features
 
     def __init__(self, hypers: ModelHypers, dataset_info: DatasetInfo) -> None:
@@ -142,6 +143,7 @@ class PET(ModelInterface[ModelHypers]):
         self.property_labels: Dict[str, List[Labels]] = {}
         self.component_labels: Dict[str, List[List[Labels]]] = {}
         self.target_names: List[str] = []
+        self.dipole_targets: List[str] = []
         self.last_layer_parameter_names: Dict[str, List[str]] = {}  # for LLPR
         for target_name, target_info in train_dataset_info.targets.items():
             self.target_names.append(target_name)
@@ -578,11 +580,16 @@ class PET(ModelInterface[ModelHypers]):
 
         # **Stage 4: Atomic Predictions**
         with torch.profiler.record_function("PET::_get_output_atomic_predictions"):
+            # Same per-system, per-atom order as `sample_labels` -- used to
+            # turn a dipole target's predicted per-atom charge into a
+            # Cartesian vector (charge * position).
+            positions = torch.cat([system.positions for system in systems], dim=0)
             atomic_predictions_dict = self._get_output_atomic_predictions(
                 atomic_predictions,
                 sample_labels,
                 outputs,
                 selected_atoms,
+                positions,
             )
 
             for k, v in atomic_predictions_dict.items():
@@ -890,6 +897,7 @@ class PET(ModelInterface[ModelHypers]):
         sample_labels: Labels,
         outputs: Dict[str, ModelOutput],
         selected_atoms: Optional[Labels],
+        positions: torch.Tensor,
     ) -> Dict[str, TensorMap]:
         """
         Wrap the per-block atomic predictions computed by the backend into TensorMaps.
@@ -909,6 +917,7 @@ class PET(ModelInterface[ModelHypers]):
         for output_name in self.target_names:
             if output_name in outputs:
                 prediction_blocks = atomic_predictions[output_name]
+                is_dipole_like = output_name in self.dipole_targets
                 blocks: List[TensorBlock] = []
                 block_index = 0
                 for shape, components, properties in zip(
@@ -917,9 +926,26 @@ class PET(ModelInterface[ModelHypers]):
                     self.property_labels[output_name],
                     strict=True,
                 ):
+                    if is_dipole_like:
+                        # `shape` here is the synthetic [1]-wide charge shape
+                        # registered in `_add_output`, not the real
+                        # rank-1 Cartesian shape the components/properties
+                        # labels below describe -- build the Cartesian
+                        # vector as charge * position instead of reshaping.
+                        charge = prediction_blocks[block_index].reshape(-1)
+                        n_properties = len(properties)
+                        atomic_dipole = charge.unsqueeze(-1) * positions
+                        if n_properties == 1:
+                            values = atomic_dipole.unsqueeze(-1)
+                        else:
+                            values = atomic_dipole.unsqueeze(-1).expand(
+                                -1, -1, n_properties
+                            )
+                    else:
+                        values = prediction_blocks[block_index].reshape([-1] + shape)
                     blocks.append(
                         TensorBlock(
-                            values=prediction_blocks[block_index].reshape([-1] + shape),
+                            values=values,
                             samples=sample_labels,
                             components=components,
                             properties=properties,
@@ -1050,15 +1076,38 @@ class PET(ModelInterface[ModelHypers]):
         :param target_name: Name of the target to add.
         :param target_info: TargetInfo object containing details about the target.
         """
+        # Rank-1 Cartesian targets (e.g. a molecular dipole moment) are
+        # registered as a synthetic per-atom SCALAR "charge" output instead
+        # of their natural [3, n_properties] shape: a plain linear map from
+        # PET's rotation-invariant node/edge features can only ever produce
+        # a rotation-invariant (i.e. orientation-independent) 3-vector, which
+        # cannot represent a properly rotating dipole -- training collapses
+        # to a near-constant output regardless of RMSE looking plausible in
+        # isolation (see bug-repros/pet-dipole-collapse/). Predicting a
+        # scalar per atom is the same well-posed regression as any other
+        # scalar target; ``_get_output_atomic_predictions`` turns it into a
+        # Cartesian vector via ``charge * position``, summed over atoms --
+        # the same construction ``experimental.lorem``'s (fixed) dipole head
+        # and the original PhysNet paper use.
+        is_dipole_like = (
+            target_info.is_cartesian
+            and len(target_info.layout.block().components) == 1
+        )
+        if is_dipole_like:
+            self.dipole_targets.append(target_name)
+
         # one output shape for each tensor block, grouped by target (i.e. tensormap)
         self.output_shapes[target_name] = {}
         for key, block in target_info.layout.items():
             dict_key = target_name
             for n, k in zip(key.names, key.values, strict=True):
                 dict_key += f"_{n}_{int(k)}"
-            self.output_shapes[target_name][dict_key] = [
-                len(comp.values) for comp in block.components
-            ] + [len(block.properties.values)]
+            if is_dipole_like:
+                self.output_shapes[target_name][dict_key] = [1]
+            else:
+                self.output_shapes[target_name][dict_key] = [
+                    len(comp.values) for comp in block.components
+                ] + [len(block.properties.values)]
 
         self.outputs[target_name] = ModelOutput(
             unit=target_info.unit,
