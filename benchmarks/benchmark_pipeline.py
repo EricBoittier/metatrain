@@ -25,7 +25,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Dict, Iterator, Tuple
+from typing import Any, Dict, Iterator, List, Tuple
 
 import numpy as np
 import torch
@@ -44,6 +44,7 @@ from metatrain.utils.data import (
 )
 from metatrain.utils.data.readers import read_systems, read_targets
 from metatrain.utils.hypers import init_with_defaults
+from metatrain.utils.logging import MetricLogger
 from metatrain.utils.loss import LossSpecification
 
 
@@ -56,11 +57,48 @@ DEFAULT_DATASET = (
     Path(__file__).parents[1] / "tests/resources/qm9_reduced_100.xyz"
 ).as_posix()
 
-# Fixed across every variant benchmarked in pipeline-bench, so that model
-# init, augmentation, and shuffling draw the same sequence of random numbers
-# and `best_val_metric` is comparable across variants, not just across
-# repeats of the same one.
-SEED = 0
+# Default only: pipeline-bench sweeps --seed across a few fixed values so a
+# cross-variant agreement isn't a coincidence of one particular seed.
+DEFAULT_SEED = 0
+
+
+@contextmanager
+def capture_epoch_metrics() -> Iterator[List[Dict[str, Any]]]:
+    """Record every ``MetricLogger.log`` call made inside this block.
+
+    ``Trainer.train`` builds its own ``MetricLogger`` internally, so there is
+    no instance to attach a listener to from the outside. Patching the class
+    method is the only interception point that sees the *raw* metrics dict
+    (train/val loss, before formatting to text) rather than a log line that
+    would need re-parsing.
+
+    :yield: A list this fills in place, one entry per ``log`` call, in the
+        order ``Trainer.train`` made them (so ``[0]`` is epoch 1).
+    """
+    records: List[Dict[str, Any]] = []
+    original = MetricLogger.log
+
+    def _capturing_log(
+        self: MetricLogger,
+        metrics: Any,
+        epoch: Any = None,
+        rank: Any = None,
+        learning_rate: Any = None,
+    ) -> None:
+        entries = [metrics] if isinstance(metrics, dict) else metrics
+        record: Dict[str, Any] = {"epoch": epoch}
+        for name, values in zip(self.names, entries):
+            record[f"{name}_loss"] = values.get("loss")
+        records.append(record)
+        return original(
+            self, metrics, epoch=epoch, rank=rank, learning_rate=learning_rate
+        )
+
+    MetricLogger.log = _capturing_log
+    try:
+        yield records
+    finally:
+        MetricLogger.log = original
 
 
 def build_dataset(path: str, key: str) -> Tuple[Dataset, Dict[str, Any]]:
@@ -203,6 +241,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--val-fraction", type=float, default=0.2)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -212,9 +251,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Train PET for a few epochs and print the per-stage timing report."""
     args = parse_args()
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     timing.enable()
 
     dataset, target_info = build_dataset(args.dataset, args.key)
@@ -246,7 +285,8 @@ def main() -> None:
     val_dataset = torch.utils.data.Subset(dataset, range(split, len(dataset)))
 
     trainer = Trainer(hypers["training"])
-    with TemporaryDirectory() as checkpoint_dir, monitor_memory() as stats:
+    with TemporaryDirectory() as checkpoint_dir, monitor_memory() as stats, \
+            capture_epoch_metrics() as epoch_metrics:
         start = time.perf_counter()
         trainer.train(
             model=model,
@@ -275,6 +315,12 @@ def main() -> None:
         f"best_val_metric {trainer.best_metric:.6f} "
         f"({hypers['training']['best_model_metric']}) at epoch {trainer.best_epoch}"
     )
+    if epoch_metrics:
+        first = epoch_metrics[0]
+        print(
+            f"epoch1_metrics train_loss={first['training_loss']:.6f} "
+            f"val_loss={first['validation_loss']:.6f}"
+        )
     print(timing.report())
     # after the report, so these batches are not part of it
     print("\n" + compare_transport(dataset, args.batch_size))
