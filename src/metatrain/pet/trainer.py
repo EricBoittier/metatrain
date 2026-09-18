@@ -136,7 +136,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     {},
                     dataset_info=DatasetInfo(
                         length_unit=model_dataset_info.length_unit,
-                        atomic_types=self.atomic_types,
+                        atomic_types=dataset_info.atomic_types,
                         targets=zbl_targets,
                     ),
                 )
@@ -153,14 +153,14 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 additive_models=additive_models,
                 scaler=scaler,
             ),
-            dataset_info=dataset_info   
+            dataset_info=dataset_info,
         )
 
     def restart(
         self,
         model: MetatrainWrapper,
         dataset_info: DatasetInfo,
-        model_hypers: ModelHypers
+        model_hypers: ModelHypers,
     ) -> MetatrainWrapper:
 
         # merge old and new dataset info

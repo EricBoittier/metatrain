@@ -1,16 +1,15 @@
-from typing import Any, Dict, List, Literal, Optional, NotRequired, Union
+from typing import Any, Dict, List, Literal, NotRequired, Optional
 
 import torch
 from metatensor.torch import Labels, TensorBlock, TensorMap
 from metatensor.torch.operations._add import _add_block_block
 from metatomic.torch import (
     AtomisticModel,
+    ModelCapabilities,
     ModelMetadata,
     ModelOutput,
-    ModelCapabilities,
-    ModelEvaluationOptions,
-    System,
     NeighborListOptions,
+    System,
 )
 from typing_extensions import TypedDict
 
@@ -18,24 +17,21 @@ from metatrain.scaler import Scaler
 from metatrain.utils.abc import ModelInterface
 from metatrain.utils.architectures import import_architecture
 from metatrain.utils.data import DatasetInfo
-from metatrain.utils.data.atomic_basis_helpers import (
-    sparsify_atomic_basis_target,
-)
+from metatrain.utils.data.atomic_basis_helpers import sparsify_atomic_basis_target
 from metatrain.utils.dtype import dtype_to_str
 
 
 class WrapperHypers(TypedDict):
-    """Hypers to initialize the model.
+    """Live modules assembled on first initialization.
 
-    These are only use on a first initialization.
-    When loading a checkpoint, the hypers are ignored
-    and instead the components of the model are loaded.
+    These are the model, additive models and scaler, not serializable
+    hyperparameter dictionaries. When loading a checkpoint they are ignored
+    and the components are reconstructed from the checkpoint instead.
     """
 
-    # Models passed directly
-    model: NotRequired[dict]
-    additive_models: NotRequired[list[dict]]
-    scaler: NotRequired[dict]
+    model: NotRequired[ModelInterface]
+    additive_models: NotRequired[List[ModelInterface]]
+    scaler: NotRequired[Scaler]
 
 
 class MetatrainWrapper(ModelInterface[WrapperHypers]):
@@ -51,7 +47,9 @@ class MetatrainWrapper(ModelInterface[WrapperHypers]):
         hypers: WrapperHypers,
         dataset_info: DatasetInfo,
     ):
-        super().__init__(hypers=hypers, dataset_info=dataset_info, metadata=self.__default_metadata__)
+        super().__init__(
+            hypers=hypers, dataset_info=dataset_info, metadata=self.__default_metadata__
+        )
 
         if "model" in hypers:
             self.model = hypers["model"]
@@ -64,9 +62,7 @@ class MetatrainWrapper(ModelInterface[WrapperHypers]):
         outputs: Dict[str, ModelOutput],
         selected_atoms: Optional[Labels] = None,
     ) -> Dict[str, TensorMap]:
-        return_dict = self.model(
-            systems, outputs, selected_atoms=selected_atoms
-        )
+        return_dict = self.model(systems, outputs, selected_atoms=selected_atoms)
 
         with torch.profiler.record_function("MTT_WRAPPER::post-processing"):
             if not self.training:
@@ -83,14 +79,14 @@ class MetatrainWrapper(ModelInterface[WrapperHypers]):
                 # in the key dimensions, and ensure properties are unpadded. This is
                 # done before adding the additive contributions, which are also
                 # sparsified (by the additive models themselves, in eval mode).
-                # for k in atomic_predictions_dict.keys():
-                #     if self.model.dataset_info.targets[k].is_atomic_basis:
-                #         return_dict[k] = sparsify_atomic_basis_target(
-                #             systems,
-                #             return_dict[k],
-                #             self.dataset_info.targets[k].layout,
-                #             species,
-                #         )
+                targets = self.dataset_info.targets
+                for name, tensor in return_dict.items():
+                    if name in targets and targets[name].is_atomic_basis:
+                        return_dict[name] = sparsify_atomic_basis_target(
+                            systems,
+                            tensor,
+                            targets[name].layout,
+                        )
 
                 for additive_model in self.additive_models:
                     outputs_for_additive_model: Dict[str, ModelOutput] = {}
@@ -103,17 +99,7 @@ class MetatrainWrapper(ModelInterface[WrapperHypers]):
                         selected_atoms,
                     )
                     for name in additive_contributions:
-                        # TODO: uncomment this after metatensor.torch.add
-                        # is updated to handle sparse sums
-                        # return_dict[name] = metatensor.torch.add(
-                        #     return_dict[name],
-                        #     additive_contributions[name].to(
-                        #         device=return_dict[name].device,
-                        #         dtype=return_dict[name].dtype
-                        #         ),
-                        # )
-                        # TODO: "manual" sparse sum: update to metatensor.torch.add
-                        # after sparse sum is implemented in metatensor.operations
+                        # Sparse sum until metatensor.torch.add handles missing keys.
                         output_blocks: List[TensorBlock] = []
                         for k, b in return_dict[name].items():
                             if k in additive_contributions[name].keys:
@@ -138,7 +124,7 @@ class MetatrainWrapper(ModelInterface[WrapperHypers]):
                             return_dict[name].keys, output_blocks
                         )
         return return_dict
-    
+
     def requested_inputs(self) -> Dict[str, ModelOutput]:
         requested_inputs = {}
 
@@ -156,7 +142,7 @@ class MetatrainWrapper(ModelInterface[WrapperHypers]):
         _add_model_requested_inputs(self.model)
 
         return requested_inputs
-    
+
     def requested_neighbor_lists(self) -> list[NeighborListOptions]:
         requested_neighbor_lists = []
 
@@ -197,24 +183,39 @@ class MetatrainWrapper(ModelInterface[WrapperHypers]):
         # the same dtype as the main model.
         model = self.model.export(metadata)
         dtype = getattr(torch, model.capabilities().dtype)
-        additive_models = [model.to(dtype).export(metadata) for model in self.additive_models]
+        additive_models = [
+            model.to(dtype).export(metadata) for model in self.additive_models
+        ]
         scaler = self.scaler.to(dtype).export(metadata)
 
         # Get a list of the capabilities of each model
-        all_capabilities = [model.capabilities()] + [
-            model.capabilities() for model in additive_models
-        ] + [scaler.capabilities()]
+        all_capabilities = (
+            [model.capabilities()]
+            + [model.capabilities() for model in additive_models]
+            + [scaler.capabilities()]
+        )
 
         # The interaction range of the model is the maximum interaction range
         # of all the models involved.
-        all_interaction_ranges = [cap.interaction_range for cap in all_capabilities if cap.interaction_range is not None]
-        interaction_range = max(all_interaction_ranges) if all_interaction_ranges else None
+        all_interaction_ranges = [
+            cap.interaction_range
+            for cap in all_capabilities
+            if cap.interaction_range is not None
+        ]
+        interaction_range = (
+            max(all_interaction_ranges) if all_interaction_ranges else None
+        )
 
         all_supported_devices = [cap.supported_devices for cap in all_capabilities]
-        # Get the intersection of all supported devices
         supported_devices = set(all_supported_devices[0])
         for devices in all_supported_devices[1:]:
             supported_devices.intersection_update(devices)
+        # keep the wrapper's preference order (cuda then cpu)
+        supported_devices = [
+            device
+            for device in self.__supported_devices__
+            if device in supported_devices
+        ]
 
         # Build the wrapper model again with the exported modules.
         to_export = self.__class__(
@@ -234,7 +235,7 @@ class MetatrainWrapper(ModelInterface[WrapperHypers]):
             atomic_types=self.dataset_info.atomic_types,
             interaction_range=interaction_range,
             length_unit=self.dataset_info.length_unit,
-            supported_devices=self.model.__supported_devices__,
+            supported_devices=supported_devices,
             dtype=dtype_to_str(dtype),
         )
 
@@ -309,8 +310,8 @@ class MetatrainWrapper(ModelInterface[WrapperHypers]):
             "scaler": self.scaler.get_checkpoint(),
         }
         return checkpoint
-    
-    def restart(self, dataset_info, model_hypers = None):
+
+    def restart(self, dataset_info, model_hypers=None):
         """
         Restart the model with new dataset_info and model_hypers.
         This is used when the model is loaded from a checkpoint and the dataset_info
