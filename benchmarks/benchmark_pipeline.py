@@ -19,6 +19,7 @@ Examples::
 """
 
 import argparse
+import random
 import threading
 import time
 from contextlib import contextmanager
@@ -26,6 +27,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, Iterator, Tuple
 
+import numpy as np
 import torch
 from omegaconf import OmegaConf
 
@@ -53,6 +55,12 @@ except ModuleNotFoundError:  # measuring memory is optional
 DEFAULT_DATASET = (
     Path(__file__).parents[1] / "tests/resources/qm9_reduced_100.xyz"
 ).as_posix()
+
+# Fixed across every variant benchmarked in pipeline-bench, so that model
+# init, augmentation, and shuffling draw the same sequence of random numbers
+# and `best_val_metric` is comparable across variants, not just across
+# repeats of the same one.
+SEED = 0
 
 
 def build_dataset(path: str, key: str) -> Tuple[Dataset, Dict[str, Any]]:
@@ -204,6 +212,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Train PET for a few epochs and print the per-stage timing report."""
     args = parse_args()
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
     timing.enable()
 
     dataset, target_info = build_dataset(args.dataset, args.key)
@@ -234,9 +245,10 @@ def main() -> None:
     train_dataset = torch.utils.data.Subset(dataset, range(split))
     val_dataset = torch.utils.data.Subset(dataset, range(split, len(dataset)))
 
+    trainer = Trainer(hypers["training"])
     with TemporaryDirectory() as checkpoint_dir, monitor_memory() as stats:
         start = time.perf_counter()
-        Trainer(hypers["training"]).train(
+        trainer.train(
             model=model,
             dtype=torch.float32,
             devices=[torch.device(args.device)],
@@ -258,6 +270,10 @@ def main() -> None:
         f"num_workers={args.num_workers}, device={args.device}, "
         f"epochs={args.epochs}, {wall:.1f} s wall (incl. validation), "
         f"{memory}\n"
+    )
+    print(
+        f"best_val_metric {trainer.best_metric:.6f} "
+        f"({hypers['training']['best_model_metric']}) at epoch {trainer.best_epoch}"
     )
     print(timing.report())
     # after the report, so these batches are not part of it
