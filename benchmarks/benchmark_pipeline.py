@@ -112,9 +112,12 @@ def main() -> None:
     )
     model = PET(hypers["model"], dataset_info)
 
-    # a small validation set: it is not part of the report, and a full second
-    # pass over the data per epoch would only add wall time
-    val_dataset = torch.utils.data.Subset(dataset, range(min(len(dataset), 8)))
+    # a small, disjoint validation set: it is not part of the report, and a
+    # full second pass over the data per epoch would only add wall time
+    val_size = min(8, len(dataset) - 1)
+    split = len(dataset) - val_size
+    train_dataset = torch.utils.data.Subset(dataset, range(split))
+    val_dataset = torch.utils.data.Subset(dataset, range(split, len(dataset)))
 
     with TemporaryDirectory() as checkpoint_dir:
         start = time.perf_counter()
@@ -122,14 +125,15 @@ def main() -> None:
             model=model,
             dtype=torch.float32,
             devices=[torch.device(args.device)],
-            train_datasets=[dataset],
+            train_datasets=[train_dataset],
             val_datasets=[val_dataset],
             checkpoint_dir=checkpoint_dir,
         )
         wall = time.perf_counter() - start
 
     print(
-        f"\nPET, {len(dataset)} structures, batch_size={args.batch_size}, "
+        f"\nPET, {len(train_dataset)} train + {len(val_dataset)} validation "
+        f"structures, batch_size={args.batch_size}, "
         f"num_workers={args.num_workers}, device={args.device}, "
         f"epochs={args.epochs}, {wall:.1f} s wall (incl. validation)\n"
     )
