@@ -8,14 +8,15 @@ one ``TensorMap`` per structure that ``group_and_join`` then joins.
 
 The work is done by a small C++ extension (``memmap_batch.cpp``), compiled on
 first use with :py:func:`torch.utils.cpp_extension.load` and cached by torch.
-When it cannot be built, or when ``METATRAIN_MEMMAP_EXTENSION=0``, an
-equivalent vectorized Python implementation is used instead.
+When it cannot be built (this logs a warning), on Windows, or when
+``METATRAIN_MEMMAP_EXTENSION=0``, an equivalent vectorized Python
+implementation is used instead.
 """
 
 import logging
 import os
 import shutil
-import warnings
+import sys
 from collections.abc import Sequence as SequenceABC
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -101,6 +102,9 @@ def extension_available() -> bool:
     """
     if os.environ.get("METATRAIN_MEMMAP_EXTENSION", "1") == "0":
         return False
+    if sys.platform == "win32":
+        # the link flags below are for GCC / Clang toolchains
+        return False
 
     try:
         import metatensor
@@ -138,10 +142,11 @@ def extension_available() -> bool:
     except Exception as error:
         logger.debug("building the MemmapDataset C++ extension failed", exc_info=True)
         first_line = str(error).strip().splitlines()[0] if str(error) else repr(error)
-        warnings.warn(
+        # a log message rather than a warning: the fallback gives the same
+        # results, so this must not fail code that turns warnings into errors
+        logger.warning(
             "could not build the MemmapDataset C++ extension, falling back to "
-            f"the slower Python implementation: {first_line[:300]}",
-            stacklevel=2,
+            f"the slower Python implementation: {first_line[:300]}"
         )
         return False
     return True
