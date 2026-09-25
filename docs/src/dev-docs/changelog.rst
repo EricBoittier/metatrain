@@ -41,6 +41,13 @@ Changed
   them to the GPU can overlap computation.
 - Dataloader workers are now kept alive between epochs instead of being
   recreated at the start of each one.
+- ``MemmapDataset`` now loads each batch at once, building the systems and one
+  ``TensorMap`` per target for the whole batch instead of joining one per
+  structure. This uses a small C++ extension compiled on first use (it needs a
+  C++ compiler and ``ninja``; set ``METATRAIN_MEMMAP_EXTENSION=0`` to skip it),
+  and falls back to an equivalent Python implementation otherwise. Collating
+  MAD-CORE batches of 16 structures is about 14 times faster with it, 8 times
+  without it.
 - Dataloaders now draw their worker seeds from a generator of their own, so how
   often a loader is iterated no longer changes the random numbers a training run
   draws afterwards. This moves the regression reference values of PET,
