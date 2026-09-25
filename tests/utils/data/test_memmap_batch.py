@@ -164,3 +164,13 @@ def test_sequence_of_samples(tmp_path):
     assert mts.equal(joined[-1].energy, dataset[6].energy)
     with pytest.raises(IndexError):
         joined[3]
+
+
+@pytest.mark.skipif(not extension_available(), reason="C++ extension unavailable")
+def test_extension_not_collected_on_export(tmp_path):
+    """Models exported after training on a MemmapDataset do not depend on it."""
+    from metatomic.torch._extensions import _collect_extensions
+
+    assert not any("metatrain_memmap" in path for path in torch.ops.loaded_libraries)
+    extensions, _ = _collect_extensions(str(tmp_path / "extensions"))
+    assert not any("metatrain_memmap" in e["name"] for e in extensions)

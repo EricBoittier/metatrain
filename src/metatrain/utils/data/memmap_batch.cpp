@@ -10,6 +10,7 @@
 #include <tuple>
 #include <vector>
 
+#include <pybind11/pybind11.h>
 #include <torch/script.h>
 
 #include <metatensor/torch.hpp>
@@ -280,3 +281,9 @@ TORCH_LIBRARY(metatrain_memmap, m) {
         load_batch
     );
 }
+
+// Loaded as a Python module rather than with torch.ops.load_library, so that
+// it stays out of torch.ops.loaded_libraries: metatomic bundles every library
+// listed there with exported models, and models never use this op. Loading the
+// module runs the TORCH_LIBRARY registration above all the same.
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {}

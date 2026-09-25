@@ -130,7 +130,9 @@ def extension_available() -> bool:
             extra_include_paths=[str(_include_directory(p)) for p in prefixes],
             extra_cflags=["-O3"],
             extra_ldflags=ldflags,
-            is_python_module=False,
+            # see the end of memmap_batch.cpp: a Python module keeps the library
+            # out of what metatomic collects when exporting models
+            is_python_module=True,
             verbose=False,
         )
     except Exception as error:
