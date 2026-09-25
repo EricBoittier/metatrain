@@ -45,6 +45,12 @@ from omegaconf import DictConfig
 from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data import Subset
 
+from metatrain.utils.data.memmap_batch import (
+    Field,
+    JoinedSamples,
+    extension_available,
+    load_batch,
+)
 from metatrain.utils.data.readers.metatensor import (
     _check_tensor_map_metadata,
     _empty_tensor_map_like,
@@ -514,14 +520,15 @@ class SerializedBatch:
 
 
 def collate_batch(
-    batch: List[Dict[str, Any]],
+    batch: Union[List[Dict[str, Any]], JoinedSamples],
     target_keys: Collection[str],
     callables: Sequence[Callable] = (),
     join_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Batch:
     """Group a list of samples into a batch and apply the transformations.
 
-    :param batch: The samples to collate.
+    :param batch: The samples to collate, or samples that are already joined
+        (as :py:meth:`MemmapDataset.__getitems__` returns them).
     :param target_keys: Names of the collated fields that are targets; the
         others are treated as extra data.
     :param callables: Transformations to apply to the collated batch, in
@@ -530,13 +537,18 @@ def collate_batch(
     :return: The collated batch.
     """
     with timed("group_and_join"):
-        collated = group_and_join(
-            batch, join_kwargs=join_kwargs or {"different_keys": "union"}
-        )
-        data = collated._asdict()
+        if isinstance(batch, JoinedSamples):
+            # the dataset loaded the batch at once, see MemmapDataset.__getitems__
+            systems = batch.systems
+            data: Dict[str, Any] = dict(batch.fields)
+        else:
+            collated = group_and_join(
+                batch, join_kwargs=join_kwargs or {"different_keys": "union"}
+            )
+            data = collated._asdict()
 
-        # pull off systems
-        systems = data.pop("system")
+            # pull off systems
+            systems = data.pop("system")
 
         # split into targets vs extra data
         targets: Dict[str, TensorMap] = {}
@@ -646,7 +658,9 @@ class CollateFn:
         self.callables: List[Callable] = callables if callables is not None else []
         self.join_kwargs: Dict[str, Any] = join_kwargs or {"different_keys": "union"}
 
-    def __call__(self, batch: List[Dict[str, Any]]) -> SerializedBatch:
+    def __call__(
+        self, batch: Union[List[Dict[str, Any]], JoinedSamples]
+    ) -> SerializedBatch:
         """
         :param batch: A batch
         :return: The serialized batch, see :py:func:`serialize_batch`.
@@ -1460,6 +1474,12 @@ class MemmapArray:
         self.dtype = np.dtype(dtype)
         self.mode = mode
         self._mm = None
+        self._tensor: Optional[torch.Tensor] = None
+
+    def __getstate__(self) -> Dict[str, Any]:
+        # the mappings are reopened on first use, rather than pickled as copies
+        # of the whole array (e.g. for a worker started with "spawn")
+        return {**self.__dict__, "_mm": None, "_tensor": None}
 
     def _ensure_open(self) -> None:
         if self._mm is None:
@@ -1471,11 +1491,26 @@ class MemmapArray:
         self._ensure_open()
         return self._mm[idx]  # type: ignore
 
+    def tensor(self) -> torch.Tensor:
+        """The whole array as a torch tensor sharing the mapping, without copy.
+
+        The mapping is copy-on-write, so torch sees a writable array while
+        writes never reach the file.
+
+        :return: The array as a tensor.
+        """
+        if self._tensor is None:
+            self._tensor = torch.from_numpy(
+                np.memmap(self.path, dtype=self.dtype, mode="c", shape=self.shape)
+            )
+        return self._tensor
+
     def close(self) -> None:
         if self._mm is not None:
             # np.memmap closes when deleted; explicit close via _mmap isn't public.
             self._mm._mmap.close()
             self._mm = None
+        self._tensor = None
 
 
 class MemmapDataset(TorchDataset):
@@ -1544,6 +1579,10 @@ class MemmapDataset(TorchDataset):
             + list(self.target_config.keys())
             + list(self.extra_data_config.keys()),
         )
+
+        # build (or load) the batched loader now, so that dataloader workers
+        # inherit it rather than each loading it again
+        extension_available()
 
         # Information about the structures
         self.ns = np.load(path / "ns.npy")
@@ -1659,6 +1698,74 @@ class MemmapDataset(TorchDataset):
         :return: Array of atom counts, one per structure.
         """
         return np.diff(self.na).astype(np.int64)
+
+    def _batch_fields(self) -> List[Field]:
+        fields = []
+        for target_key, target_options in self.target_config.items():
+            array = self.target_arrays[target_key]
+            is_energy = (
+                target_options["quantity"] == "energy"
+                and target_options["sample_kind"] == "system"
+                and target_options["num_subtargets"] == 1
+            )
+            forces = stress = None
+            if is_energy and target_options["forces"]:
+                forces = self.target_arrays[f"{target_key}_forces"].tensor()
+            if is_energy and target_options["stress"]:
+                stress = self.target_arrays[f"{target_key}_stress"].tensor()
+            fields.append(
+                Field(
+                    name=target_key,
+                    array=array.tensor(),
+                    # the same test as __getitem__
+                    per_atom=array.shape[0] == self.na[-1],
+                    property_name=(
+                        "energy" if is_energy else target_key.replace("mtt::", "")
+                    ),
+                    forces=forces,
+                    stress=stress,
+                )
+            )
+        for key, array in self.extra_data_arrays.items():
+            fields.append(
+                Field(
+                    name=key,
+                    array=array.tensor(),
+                    per_atom=self.extra_data_config[key]["sample_kind"] == "atom",
+                    property_name=key.replace("mtt::", ""),
+                )
+            )
+        return fields
+
+    def __getitems__(self, indices: List[int]) -> Union[JoinedSamples, List[Any]]:
+        """Load a whole batch at once, already joined along the samples axis.
+
+        ``DataLoader`` calls this instead of ``__getitem__`` for every sample;
+        :py:func:`collate_batch` then skips ``group_and_join``. The result is
+        the same as joining the samples of ``__getitem__``, see
+        :py:mod:`metatrain.utils.data.memmap_batch`.
+
+        :param indices: The structures of the batch.
+        :return: The joined samples, or a list of samples as ``__getitem__``
+            returns them for the cases the batched loader does not handle
+            (momenta or masses attached to the systems, repeated structures).
+        """
+        if (
+            self.momenta is not None
+            or self.masses is not None
+            or len(set(indices)) != len(indices)
+        ):
+            return [self[i] for i in indices]
+
+        return load_batch(
+            na=self.na,
+            positions=self.x.tensor(),
+            types=self.a.tensor(),
+            cells=self.c.tensor() if hasattr(self, "c") else None,
+            indices=indices,
+            fields=self._batch_fields(),
+            sample=lambda k: self[indices[k]],
+        )
 
     def __getitem__(self, i: int) -> Any:
         a = torch.tensor(self.a[self.na[i] : self.na[i + 1]], dtype=torch.int32)
