@@ -7,6 +7,13 @@ from torch import nn
 from metatrain.utils.architectures import get_default_hypers
 from metatrain.utils.data import Dataset
 from metatrain.utils.data.dataset import Subset
+from metatrain.utils.fit_cache import (
+    copy_cached_fit,
+    get_fit_cache_path,
+    is_cached,
+    preserve_rng,
+    store_fit,
+)
 from metatrain.utils.io import load_model
 
 from ._base_composition import FixedCompositionWeights
@@ -50,9 +57,31 @@ def train_or_load_composition_model(
     :param is_distributed: Whether training is distributed
     :param checkpoint_dir: Directory to save the composition model checkpoint
     """
+    cache = None
+    if isinstance(atomic_baseline, dict):
+        # The model is hashed before fitting, so that e.g. the weights it
+        # inherited for other targets when fine-tuning are part of the key.
+        cache = get_fit_cache_path(
+            "composition",
+            [
+                composition_model,
+                other_additive_models,
+                atomic_baseline,
+                train_datasets,
+            ],
+        )
+        if is_cached(cache, composition_model.dummy_buffer.device, is_distributed):
+            assert cache is not None
+            copy_cached_fit(
+                cache, checkpoint_dir, "composition_model.ckpt", is_distributed
+            )
+            atomic_baseline = str(cache)
+
     if isinstance(atomic_baseline, str):
         logging.info(f"Loading composition model from {atomic_baseline}")
-        loaded = load_model(atomic_baseline)
+        # Building the loaded model draws from the global random state.
+        with preserve_rng(cache):
+            loaded = load_model(atomic_baseline)
         if not isinstance(loaded, CompositionModel):
             raise ValueError(
                 f"The model loaded from {atomic_baseline} is a "
@@ -100,11 +129,17 @@ def train_or_load_composition_model(
         trainer._additive_models = other_additive_models
         # The trainer fits on devices[0]; pass the model's current device so
         # embedded training stays where the parent architecture put the model.
-        trainer.train(
-            model=composition_model,
-            dtype=torch.float64,
-            devices=[composition_model.dummy_buffer.device],
-            train_datasets=train_datasets,
-            val_datasets=train_datasets,
-            checkpoint_dir=checkpoint_dir,
+        with preserve_rng(cache):
+            trainer.train(
+                model=composition_model,
+                dtype=torch.float64,
+                devices=[composition_model.dummy_buffer.device],
+                train_datasets=train_datasets,
+                val_datasets=train_datasets,
+                checkpoint_dir=checkpoint_dir,
+            )
+        store_fit(
+            cache,
+            lambda path: trainer.save_checkpoint(composition_model, path),
+            is_distributed,
         )

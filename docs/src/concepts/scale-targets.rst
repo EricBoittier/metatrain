@@ -200,3 +200,28 @@ before the additive model contribution is added and the final predictions are re
 This ensures that predictions are always in physical units regardless of whether the
 target is single- or multi-property.
 
+
+Reusing the fits across trainings
+---------------------------------
+
+The composition baseline and the scales are fitted by iterating once over the
+training set each, before the first epoch, which can take a while for large
+datasets. Since the fits only depend on the data, the targets and the additive
+models, and not on e.g. the batch size, they can be shared between trainings on
+the same data by setting the ``METATRAIN_FIT_CACHE_DIR`` environment variable to
+a directory:
+
+.. code-block:: bash
+
+    export METATRAIN_FIT_CACHE_DIR=~/.cache/metatrain/fits
+    mtt train options.yaml
+
+The first training stores its fits there, and later trainings with the same
+data, targets, additive models and fixed weights load them instead of fitting
+again. Files are identified by their path, size and modification time, so
+editing a dataset file invalidates its fits. See :py:mod:`metatrain.utils.fit_cache`
+for everything the fits are keyed on.
+
+With the cache enabled, the fits no longer consume the global random state, so
+that a training is the same whether it hits the cache or not; but it differs
+from a training with the cache disabled, just like it would with another seed.

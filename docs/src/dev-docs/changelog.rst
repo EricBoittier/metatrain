@@ -30,6 +30,10 @@ Fixed
 Added
 #####
 
+- The composition and scaler fits can be cached across trainings on the same
+  data, by setting the ``METATRAIN_FIT_CACHE_DIR`` environment variable. This
+  skips the two passes over the training set that precede the first epoch.
+
 Changed
 #######
 

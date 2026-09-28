@@ -8,6 +8,13 @@ from torch import nn
 from metatrain.utils.architectures import get_default_hypers
 from metatrain.utils.data import Dataset
 from metatrain.utils.data.dataset import Subset
+from metatrain.utils.fit_cache import (
+    copy_cached_fit,
+    get_fit_cache_path,
+    is_cached,
+    preserve_rng,
+    store_fit,
+)
 from metatrain.utils.io import load_model
 
 from .documentation import FixedScalerWeights
@@ -63,9 +70,35 @@ def train_or_load_scaler(
     :param trainer_hypers: Additional hyperparameters for the trainer.
     :param checkpoint_dir: Directory to save the scaler checkpoint
     """
+    cache = None
+    if not isinstance(fixed_weights, str):
+        # The additive models are hashed with their weights: a scaler fitted on
+        # top of a different composition baseline is never reused.
+        cache = get_fit_cache_path(
+            "scaler",
+            [
+                scaler,
+                additive_models,
+                fixed_weights or {},
+                list(per_structure_targets),
+                {
+                    name: value
+                    for name, value in (trainer_hypers or {}).items()
+                    if name not in ("batch_size", "num_workers")
+                },
+                train_datasets,
+            ],
+        )
+        if is_cached(cache, scaler.dummy_buffer.device, is_distributed):
+            assert cache is not None
+            copy_cached_fit(cache, checkpoint_dir, "scaler.ckpt", is_distributed)
+            fixed_weights = str(cache)
+
     if isinstance(fixed_weights, str):
         logging.info(f"Loading scaler from {fixed_weights}")
-        loaded = load_model(fixed_weights)
+        # Building the loaded model draws from the global random state.
+        with preserve_rng(cache):
+            loaded = load_model(fixed_weights)
         if not isinstance(loaded, Scaler):
             raise ValueError(
                 f"The model loaded from {fixed_weights} is a "
@@ -120,11 +153,15 @@ def train_or_load_scaler(
 
         trainer = Trainer(hypers)
         logging.info("Calculating scaler weights")
-        trainer.train(
-            model=scaler,
-            dtype=torch.float64,
-            devices=[scaler.dummy_buffer.device],
-            train_datasets=train_datasets,
-            val_datasets=train_datasets,
-            checkpoint_dir=checkpoint_dir,
+        with preserve_rng(cache):
+            trainer.train(
+                model=scaler,
+                dtype=torch.float64,
+                devices=[scaler.dummy_buffer.device],
+                train_datasets=train_datasets,
+                val_datasets=train_datasets,
+                checkpoint_dir=checkpoint_dir,
+            )
+        store_fit(
+            cache, lambda path: trainer.save_checkpoint(scaler, path), is_distributed
         )
