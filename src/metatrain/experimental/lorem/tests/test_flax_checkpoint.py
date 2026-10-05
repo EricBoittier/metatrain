@@ -180,6 +180,43 @@ def test_unsupported_model_yaml(fields):
         model_hypers_from_yaml({"lorem.Lorem": spec})
 
 
+def test_read_export(tmp_path):
+    """``params.npz``, ``model.yaml``, ``baseline.yaml``, and ``export.yaml``."""
+    folder = _export("lorem_bec", tmp_path)
+    spec = yaml.safe_load((folder / "model.yaml").read_text())
+    ((class_name, fields),) = spec.items()
+    fields["inputs"] = []
+    (folder / "model.yaml").write_text(yaml.safe_dump({class_name: fields}))
+    # atomic numbers may be quoted in the checkpoint yaml
+    (folder / "baseline.yaml").write_text(
+        "elemental:\n  '1': -0.5\n  '6': -3.0\n  '8': -4.5\n"
+    )
+
+    name, hypers, params, baseline = read_export(folder)
+
+    assert name == "lorem.models.bec.LoremBEC"
+    assert baseline == BASELINE
+    assert hypers["cutoff"] == fields["cutoff"]
+    assert hypers["initialize_node_features"] is False
+    assert "inputs" not in hypers
+    assert "cutoff_fn" not in hypers
+    with np.load(folder / "params.npz") as stored:
+        assert set(params) == set(stored.files)
+        assert not any(key.startswith("params/") for key in params)
+        for key in stored.files:
+            np.testing.assert_array_equal(params[key], stored[key])
+
+
+def test_model_yaml_inputs_are_rejected(tmp_path):
+    folder = _export("lorem", tmp_path)
+    spec = yaml.safe_load((folder / "model.yaml").read_text())
+    ((class_name, fields),) = spec.items()
+    fields["inputs"] = ["charge"]
+    (folder / "model.yaml").write_text(yaml.safe_dump({class_name: fields}))
+    with pytest.raises(ValueError, match="conditioning"):
+        read_export(folder)
+
+
 def test_export_format_is_checked(tmp_path):
     (_export("lorem", tmp_path) / "export.yaml").write_text("format: 2\n")
     with pytest.raises(ValueError, match="export format 2"):
