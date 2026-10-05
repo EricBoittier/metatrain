@@ -473,9 +473,11 @@ class LongRange(torch.nn.Module):
 
         cells = torch.stack([system.cell for system in systems])
         pbc = torch.stack([system.pbc for system in systems])
-        host = torch.cat(
-            [torch.linalg.norm(cells, dim=-1), pbc.to(cells.dtype)], dim=1
-        ).detach().cpu()
+        host = (
+            torch.cat([torch.linalg.norm(cells, dim=-1), pbc.to(cells.dtype)], dim=1)
+            .detach()
+            .cpu()
+        )
         sizes_host = torch.tensor(sizes, dtype=torch.long)
         n_pbc = host[:, 3:].sum(dim=1)
         k_cutoff = 2 * math.pi / self.lr_wavelength
@@ -525,9 +527,10 @@ class LongRange(torch.nn.Module):
                 np_sizes.to(device),
                 np_offsets.to(device),
             )
-            local = torch.arange(total, device=device) - (
-                torch.cumsum(n_pairs, 0) - n_pairs
-            )[pair_system]
+            local = (
+                torch.arange(total, device=device)
+                - (torch.cumsum(n_pairs, 0) - n_pairs)[pair_system]
+            )
             size = np_sizes[pair_system]
             first = local // size + np_offsets[pair_system]
             second = local % size + np_offsets[pair_system]
@@ -567,9 +570,10 @@ class LongRange(torch.nn.Module):
             p_index = p_index.to(device)
 
             # integer k grid in fftfreq order: 0, 1, ..., -2, -1
-            local_k = torch.arange(total_k, device=device) - (
-                torch.cumsum(n_k, 0) - n_k
-            )[k_system]
+            local_k = (
+                torch.arange(total_k, device=device)
+                - (torch.cumsum(n_k, 0) - n_k)[k_system]
+            )
             nk = ns[k_system]
             iz = local_k % nk[:, 2]
             iy = (local_k // nk[:, 2]) % nk[:, 1]
@@ -587,9 +591,10 @@ class LongRange(torch.nn.Module):
             ) / volumes.index_select(0, k_system)
 
             # (atom, k) pairs within each periodic system
-            local_ak = torch.arange(total_ak, device=device) - (
-                torch.cumsum(n_ak, 0) - n_ak
-            )[ak_system]
+            local_ak = (
+                torch.arange(total_ak, device=device)
+                - (torch.cumsum(n_ak, 0) - n_ak)[ak_system]
+            )
             size = p_sizes[ak_system]
             ak_atom = local_ak % size + p_offsets[ak_system]
             ak_k = local_ak // size + (torch.cumsum(n_k, 0) - n_k)[ak_system]
@@ -624,9 +629,12 @@ class LongRange(torch.nn.Module):
             all_volumes = torch.ones(n_systems, dtype=dtype, device=device)
             all_volumes = all_volumes.index_put([p_index], volumes)
             kspace = kspace - charges * ewald.self_contribution()
-            kspace = kspace - 2 * ewald.background_correction() * (
-                charge_tot / all_volumes.unsqueeze(-1)
-            )[atom_system]
+            kspace = (
+                kspace
+                - 2
+                * ewald.background_correction()
+                * (charge_tot / all_volumes.unsqueeze(-1))[atom_system]
+            )
             potentials = potentials + kspace * atom_periodic.unsqueeze(-1).to(dtype)
 
         potentials = potentials / 2

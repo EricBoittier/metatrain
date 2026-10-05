@@ -172,5 +172,5 @@ def test_batched_potentials_match_per_system_calls():
             forces_squared = sum((g**2).sum() for g in grads[1:])
             (second,) = torch.autograd.grad(forces_squared, charges)
             results.append((pot, *grads, second))
-        for batched, reference in zip(*results):
+        for batched, reference in zip(*results, strict=True):
             torch.testing.assert_close(batched, reference)
