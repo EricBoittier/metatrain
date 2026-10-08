@@ -27,8 +27,48 @@ Unreleased
 Fixed
 #####
 
+- Ensemble losses (``gaussian_nll_ensemble``, ``gaussian_crps_ensemble`` and
+  ``empirical_crps_ensemble``) now work for targets with components, such as
+  ``non_conservative_force``, instead of failing when the mean and variance
+  blocks are built.
+- PET now symmetrizes and divides by the cell volume the predictions of
+  ``non_conservative_stress/<variant>`` targets, as it already did for
+  ``non_conservative_stress``.
+- ``MemmapDataset`` can now load generic targets with a variant (e.g.
+  ``non_conservative_stress/<variant>``), instead of failing with
+  ``'<name>/<variant>' is not a valid label name``.
+- Dataset merging and training restarts now accept equivalent unit spellings
+  such as ``A`` and ``angstrom`` or ``eV/A^3`` and
+  ``eV/angstrom^3``, avoiding false unit incompatibility errors.
+- PET attention now excludes keys with a zero cutoff factor with ``-inf`` instead of
+  penalising them with ``log(1e-15)``.
+
 Added
 #####
+
+- Added ``experimental.lorem`` architecture (*Learning Long-Range
+  Representations with Equivariant Messages*, https://arxiv.org/abs/2507.19382).
+
+Changed
+#######
+
+Removed
+#######
+
+Version 2026.4.1 - 2026-09-25
+-----------------------------
+
+Fixed
+#####
+
+- ``ZBL`` now accepts every spelling of the angstrom that metatomic accepts
+  (``angstrom``, ``Angstrom``, ``A``, ...), instead of only the exact string
+  ``angstrom``.
+
+Added
+#####
+
+- The DPA3 architecture now can load pretrained multi-task DPA3 models.
 
 Changed
 #######
