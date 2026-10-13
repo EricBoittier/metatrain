@@ -42,6 +42,7 @@ from metatrain.utils.neighbor_lists import (
     get_requested_neighbor_lists,
     get_system_with_neighbor_lists_transform,
 )
+from metatrain.utils.optimizer import create_optimizer
 from metatrain.utils.per_atom import average_by_num_atoms
 from metatrain.utils.scaler import get_remove_scale_transform
 from metatrain.utils.system_data import get_system_data_transform
@@ -364,16 +365,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
             for grad, ginfo in info["gradients"].items():
                 logging.info(f"\t{name}::{grad}: {ginfo}")
 
-        if self.hypers["weight_decay"] is not None:
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=self.hypers["learning_rate"],
-                weight_decay=self.hypers["weight_decay"],
-            )
-        else:
-            optimizer = torch.optim.Adam(
-                model.parameters(), lr=self.hypers["learning_rate"]
-            )
+        optimizer = create_optimizer(model.parameters(), self.hypers)
 
         if self.optimizer_state_dict is not None:
             # try to load the optimizer state dict, but this is only possible

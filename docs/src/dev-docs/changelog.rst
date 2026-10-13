@@ -48,6 +48,9 @@ Added
 
 - Added ``experimental.lorem`` architecture (*Learning Long-Range
   Representations with Equivariant Messages*, https://arxiv.org/abs/2507.19382).
+- Training accepts ``optimizer: muon`` for PET, SOAP-BPNN, LLPR, FlashMD,
+  symplectic FlashMD, SPACE, DPA3, and the classifier. Matrix parameters are
+  updated with Muon and the remaining parameters with AdamW.
 
 Changed
 #######

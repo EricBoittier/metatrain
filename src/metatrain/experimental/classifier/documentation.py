@@ -24,7 +24,7 @@ extract features for low-dimensional visualization and/or collective variables.
 
 """
 
-from typing import Optional
+from typing import Literal, Optional
 
 from typing_extensions import TypedDict
 
@@ -64,6 +64,14 @@ class TrainerHypers(TypedDict):
     """Number of training epochs."""
     learning_rate: float = 0.001
     """Learning rate for the optimizer."""
+    optimizer: Literal["adam", "muon"] = "adam"
+    """Optimizer used for training.
+
+    ``adam`` (default) uses Adam. ``muon`` updates 2D parameters with Muon
+    and every other parameter with AdamW, both at ``learning_rate``. Muon
+    uses momentum 0.95, Nesterov, and RMS-matched learning-rate scaling,
+    and requires PyTorch >= 2.9.
+    """
     warmup_fraction: float = 0.1
     """Fraction of total training steps used for learning rate warmup.
     The learning rate increases linearly from 0 to the base learning rate

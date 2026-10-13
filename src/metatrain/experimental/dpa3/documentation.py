@@ -280,6 +280,14 @@ class TrainerHypers(TypedDict):
     """Number of epochs."""
     learning_rate: float = 0.001
     """Learning rate."""
+    optimizer: Literal["adam", "muon"] = "adam"
+    """Optimizer used for training.
+
+    ``adam`` (default) uses Adam. ``muon`` updates 2D parameters with Muon
+    and every other parameter with AdamW, both at ``learning_rate``. Muon
+    uses momentum 0.95, Nesterov, and RMS-matched learning-rate scaling,
+    and requires PyTorch >= 2.9.
+    """
 
     scheduler_patience: int = 100
     """Number of epochs with no improvement before reducing the learning rate."""

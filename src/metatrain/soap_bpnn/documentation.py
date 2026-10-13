@@ -153,6 +153,14 @@ class TrainerHypers(TypedDict):
     """Fraction of training steps used for learning rate warmup."""
     learning_rate: float = 1e-3
     """Learning rate."""
+    optimizer: Literal["adam", "muon"] = "adam"
+    """Optimizer used for training.
+
+    ``adam`` (default) uses Adam. ``muon`` updates 2D parameters with Muon
+    and every other parameter with AdamW, both at ``learning_rate``. Muon
+    uses momentum 0.95, Nesterov, and RMS-matched learning-rate scaling,
+    and requires PyTorch >= 2.9.
+    """
     log_interval: int = 5
     """Interval to log metrics."""
     checkpoint_interval: int = 25

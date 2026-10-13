@@ -284,6 +284,14 @@ class TrainerHypers(TypedDict):
     slow or decrease it (e.g., to 0.001 or less) if you see divergence in the first
     few epochs and/or instabilities.
     """
+    optimizer: Literal["adam", "muon"] = "adam"
+    """Optimizer used for training.
+
+    ``adam`` (default) uses Adam. ``muon`` updates 2D parameters with Muon
+    and every other parameter with AdamW, both at ``learning_rate``. Muon
+    uses momentum 0.95, Nesterov, and RMS-matched learning-rate scaling,
+    and requires PyTorch >= 2.9.
+    """
 
     warmup_fraction: float = 0.01
     """Fraction of training steps for learning rate warmup."""

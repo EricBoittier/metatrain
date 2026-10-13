@@ -23,6 +23,7 @@ from metatrain.utils.neighbor_lists import (
     get_requested_neighbor_lists,
     get_system_with_neighbor_lists,
 )
+from metatrain.utils.optimizer import create_optimizer
 
 from .documentation import TrainerHypers
 from .model import Classifier
@@ -143,10 +144,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
         # Setup optimizer
         # The backbone parameters have requires_grad=False, so they are excluded.
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=self.hypers["learning_rate"],
-        )
+        optimizer = create_optimizer(model.parameters(), self.hypers)
 
         # Setup learning rate scheduler with warmup
         total_steps = len(train_dataloader) * self.hypers["num_epochs"]

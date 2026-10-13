@@ -134,6 +134,15 @@ class TrainerHypers(TypedDict):
     """Fraction of training steps used for learning rate warmup."""
     learning_rate: float = 3e-4
     """Learning rate."""
+    optimizer: Literal["adam", "muon"] = "adam"
+    """Optimizer used for training.
+
+    ``adam`` (default) uses Adam, or AdamW when ``weight_decay`` is set.
+    ``muon`` updates 2D parameters with Muon and every other parameter with
+    AdamW, both at ``learning_rate``. Muon uses momentum 0.95, Nesterov, and
+    RMS-matched learning-rate scaling, and requires PyTorch >= 2.9.
+    ``weight_decay: null`` means no decay.
+    """
     weight_decay: Optional[float] = None
     """Weight decay (L2 penalty)."""
     log_interval: int = 1
