@@ -280,13 +280,16 @@ class TrainerHypers(TypedDict):
     """Number of epochs."""
     learning_rate: float = 0.001
     """Learning rate."""
-    optimizer: Literal["adam", "muon"] = "adam"
+    optimizer: Literal["adam", "amsgrad", "muon", "muon_rms", "rmsprop"] = "adam"
     """Optimizer used for training.
 
     ``adam`` (default) uses Adam. ``muon`` updates 2D parameters with Muon
     and every other parameter with AdamW, both at ``learning_rate``. Muon
     uses momentum 0.95, Nesterov, and RMS-matched learning-rate scaling,
-    and requires PyTorch >= 2.9.
+    and requires PyTorch >= 2.9. ``muon_rms`` is that Muon update with an
+    RMS-norm over the last dimension of the orthogonalized matrix, then
+    scaled by ``0.2``. ``amsgrad`` uses Adam with AMSGrad's running maximum
+    of the second moment. ``rmsprop`` uses RMSprop at ``learning_rate``.
     """
 
     scheduler_patience: int = 100

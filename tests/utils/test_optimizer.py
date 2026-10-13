@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from torch.optim.lr_scheduler import LambdaLR
 
-from metatrain.utils.optimizer import MuonAdamW, create_optimizer
+from metatrain.utils.optimizer import MuonAdamW, MuonRMSNorm, create_optimizer
 
 
 def _tiny_module() -> nn.Module:
@@ -43,6 +43,91 @@ def test_adam_is_the_default():
     )
     assert type(decayed) is torch.optim.AdamW
     assert decayed.param_groups[0]["weight_decay"] == 0.01
+
+
+def test_amsgrad_uses_the_second_moment_maximum():
+    parameter = nn.Parameter(torch.randn(3))
+    optimizer = create_optimizer(
+        [parameter], {"optimizer": "amsgrad", "learning_rate": 1e-3}
+    )
+    assert type(optimizer) is torch.optim.Adam
+    assert optimizer.param_groups[0]["amsgrad"] is True
+
+    before = parameter.detach().clone()
+    parameter.square().sum().backward()
+    optimizer.step()
+    assert not torch.equal(before, parameter)
+    assert "max_exp_avg_sq" in optimizer.state[parameter]
+
+    decayed = create_optimizer(
+        [nn.Parameter(torch.zeros(2))],
+        {"optimizer": "amsgrad", "learning_rate": 1e-3, "weight_decay": 0.01},
+    )
+    assert type(decayed) is torch.optim.AdamW
+    assert decayed.param_groups[0]["amsgrad"] is True
+    assert decayed.param_groups[0]["weight_decay"] == 0.01
+
+
+def test_rmsprop_steps():
+    torch.manual_seed(0)
+    parameter = nn.Parameter(torch.randn(4, 3))
+    optimizer = create_optimizer(
+        [parameter], {"optimizer": "rmsprop", "learning_rate": 1e-2}
+    )
+    assert type(optimizer) is torch.optim.RMSprop
+    assert optimizer.param_groups[0]["weight_decay"] == 0.0
+    assert optimizer.param_groups[0]["lr"] == 1e-2
+
+    before = parameter.detach().clone()
+    loss = parameter.square().sum()
+    loss.backward()
+    optimizer.step()
+    assert not torch.equal(before, parameter)
+
+    decayed = create_optimizer(
+        [nn.Parameter(torch.zeros(2))],
+        {"optimizer": "rmsprop", "learning_rate": 1e-2, "weight_decay": 0.01},
+    )
+    assert type(decayed) is torch.optim.RMSprop
+    assert decayed.param_groups[0]["weight_decay"] == 0.01
+
+
+def test_muon_rms_differs_from_muon_and_roundtrips():
+    torch.manual_seed(0)
+    module = _tiny_module()
+    other = _tiny_module()
+    other.load_state_dict(
+        {key: value.clone() for key, value in module.state_dict().items()}
+    )
+    rms_opt = create_optimizer(
+        module.parameters(), {"optimizer": "muon_rms", "learning_rate": 0.05}
+    )
+    muon_opt = create_optimizer(
+        other.parameters(), {"optimizer": "muon", "learning_rate": 0.05}
+    )
+    assert isinstance(rms_opt, MuonAdamW)
+    assert isinstance(rms_opt._muon, MuonRMSNorm)
+    assert isinstance(muon_opt._muon, torch.optim.Muon)
+    assert id(module.linear.weight) in _param_ids(rms_opt._muon)
+    assert id(module.linear.bias) in _param_ids(rms_opt._adamw)
+
+    _backward(module)
+    for source, dest in zip(module.parameters(), other.parameters(), strict=True):
+        assert source.grad is not None
+        dest.grad = source.grad.detach().clone()
+    rms_opt.step()
+    muon_opt.step()
+    assert not torch.allclose(module.linear.weight, other.linear.weight)
+
+    restored = create_optimizer(
+        module.parameters(), {"optimizer": "muon_rms", "learning_rate": 0.05}
+    )
+    restored.load_state_dict(copy.deepcopy(rms_opt.state_dict()))
+    assert isinstance(restored, MuonAdamW)
+    assert isinstance(restored._muon, MuonRMSNorm)
+    original_buf = rms_opt._muon.state[module.linear.weight]["momentum_buffer"]
+    restored_buf = restored._muon.state[module.linear.weight]["momentum_buffer"]
+    torch.testing.assert_close(restored_buf, original_buf)
 
 
 def test_unknown_optimizer_name():

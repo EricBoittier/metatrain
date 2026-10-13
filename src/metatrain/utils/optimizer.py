@@ -3,6 +3,9 @@
 ``adam`` keeps the historical Adam / AdamW choice. ``muon`` updates matrix
 parameters with Muon and every other parameter with AdamW, as one optimizer
 so the existing learning-rate scheduler and checkpoints still apply.
+``rmsprop`` is RMSprop, the root-mean-square gradient method.
+``muon_rms`` is Muon with an RMS-norm on the orthogonalized update.
+``amsgrad`` is Adam with the AMSGrad second-moment maximum.
 """
 
 from collections.abc import Callable, Iterable, Mapping
@@ -10,10 +13,112 @@ from typing import Any, Optional
 
 import torch
 from torch import Tensor
+from torch.nn import functional as F
 
 
 _MUON_MOMENTUM = 0.95
 _MUON_ADJUST_LR = "match_rms_adamw"
+_MUON_NS_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
+_MUON_NS_STEPS = 5
+_MUON_NS_EPS = 1e-7
+# Once each row has unit RMS, 0.2 puts the update on an Adam-like scale.
+_MUON_RMS_LR_SCALE = 0.2
+_MUON_RMS_EPS = 1e-8
+
+
+def _orthogonalize(update: Tensor) -> Tensor:
+    # Same Newton-Schulz iteration as torch.optim.Muon.
+    from torch.optim import _muon as muon_impl
+
+    orthogonalize = getattr(muon_impl, "_zeropower_via_newtonschulz", None)
+    if orthogonalize is None:
+        raise RuntimeError(
+            "optimizer 'muon_rms' requires PyTorch >= 2.9, "
+            "which provides torch.optim.Muon"
+        )
+    return orthogonalize(update, _MUON_NS_COEFFICIENTS, _MUON_NS_STEPS, _MUON_NS_EPS)
+
+
+def _as_float(value: float | Tensor) -> float:
+    if isinstance(value, Tensor):
+        return float(value.item())
+    return float(value)
+
+
+class MuonRMSNorm(torch.optim.Optimizer):
+    """Muon whose orthogonalized update is RMS-normalized over its last axis.
+
+    This follows the variant in https://github.com/xTimeCrystal/Muon-RMS-Norm.
+    For an ``nn.Linear`` weight of shape ``(out, in)`` the last axis is the
+    input dimension. After the norm, the update is scaled by ``0.2`` instead
+    of Muon's shape-based RMS matching. Only 2D parameters are accepted.
+
+    :param params: Matrix parameters to update.
+    :param lr: Learning rate before the ``0.2`` scale.
+    :param weight_decay: Decoupled weight decay.
+    :param momentum: Momentum coefficient.
+    """
+
+    def __init__(
+        self,
+        params: Iterable[Tensor],
+        lr: float,
+        weight_decay: float,
+        momentum: float = _MUON_MOMENTUM,
+    ) -> None:
+        param_list = list(params)
+        if len(param_list) == 0:
+            raise ValueError("optimizer got an empty parameter list")
+        for param in param_list:
+            if param.ndim != 2:
+                raise ValueError(
+                    "MuonRMSNorm only supports 2D parameters, got "
+                    f"shape {tuple(param.shape)}"
+                )
+        super().__init__(
+            param_list,
+            {
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "momentum": momentum,
+                "nesterov": True,
+            },
+        )
+
+    @torch.no_grad()
+    def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
+        """Orthogonalize, RMS-normalize, and apply the Muon update.
+
+        :param closure: Optional closure that reevaluates the model and
+            returns the loss.
+        :return: The loss returned by ``closure``, if it was provided.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = _as_float(group["lr"])
+            weight_decay = float(group["weight_decay"])
+            momentum = float(group["momentum"])
+            for param in group["params"]:
+                grad = param.grad
+                if grad is None:
+                    continue
+                state = self.state[param]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(param)
+                buf = state["momentum_buffer"]
+                buf.lerp_(grad, 1 - momentum)
+                update = grad.lerp(buf, momentum) if group["nesterov"] else buf
+                update = _orthogonalize(update)
+                update = F.rms_norm(
+                    update.float(), (update.shape[-1],), eps=_MUON_RMS_EPS
+                )
+                param.mul_(1 - lr * weight_decay)
+                param.add_(update, alpha=-_MUON_RMS_LR_SCALE * lr)
+        return loss
 
 
 class MuonAdamW(torch.optim.Optimizer):
@@ -29,6 +134,8 @@ class MuonAdamW(torch.optim.Optimizer):
         every other rank uses AdamW.
     :param lr: Learning rate applied to both groups before scheduling.
     :param weight_decay: Decoupled weight decay applied to both groups.
+    :param rms_norm: When true, matrix updates use :class:`MuonRMSNorm`
+        instead of :class:`torch.optim.Muon`.
     """
 
     def __init__(
@@ -36,6 +143,7 @@ class MuonAdamW(torch.optim.Optimizer):
         params: Iterable[Tensor],
         lr: float,
         weight_decay: float,
+        rms_norm: bool = False,
     ) -> None:
         param_list = list(params)
         muon_params = [param for param in param_list if param.ndim == 2]
@@ -53,15 +161,23 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon: Optional[torch.optim.Optimizer] = None
         self._adamw: Optional[torch.optim.Optimizer] = None
         if len(muon_params) > 0:
-            muon_cls = torch.optim.Muon
-            self._muon = muon_cls(
-                muon_params,
-                lr=lr,
-                weight_decay=weight_decay,
-                momentum=_MUON_MOMENTUM,
-                nesterov=True,
-                adjust_lr_fn=_MUON_ADJUST_LR,
-            )
+            if rms_norm:
+                self._muon = MuonRMSNorm(
+                    muon_params,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    momentum=_MUON_MOMENTUM,
+                )
+            else:
+                muon_cls = torch.optim.Muon
+                self._muon = muon_cls(
+                    muon_params,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    momentum=_MUON_MOMENTUM,
+                    nesterov=True,
+                    adjust_lr_fn=_MUON_ADJUST_LR,
+                )
         if len(adamw_params) > 0:
             self._adamw = torch.optim.AdamW(
                 adamw_params,
@@ -137,9 +253,12 @@ def create_optimizer(
     """Create the optimizer selected by the training hyperparameters.
 
     ``adam`` (the default) matches the historical behavior: Adam, or AdamW
-    when ``weight_decay`` is set. ``muon`` uses :class:`MuonAdamW`. A missing
-    ``weight_decay`` means no decay; for Muon that is ``0.0`` rather than
-    PyTorch's own Muon default of ``0.1``.
+    when ``weight_decay`` is set. ``muon`` uses :class:`MuonAdamW`.
+    ``rmsprop`` uses :class:`torch.optim.RMSprop`. ``muon_rms`` uses
+    :class:`MuonRMSNorm` for matrix parameters. ``amsgrad`` uses Adam with
+    ``amsgrad=True``, or AdamW when ``weight_decay`` is set. A missing
+    ``weight_decay`` means no decay; for Muon, Muon RMS-norm, and RMSprop
+    that is ``0.0`` rather than PyTorch's own Muon default of ``0.1``.
 
     :param parameters: Model parameters, as from ``module.parameters()``.
     :param hypers: Training hyperparameters. Reads ``optimizer``,
@@ -156,16 +275,34 @@ def create_optimizer(
             return torch.optim.AdamW(parameters, lr=lr, weight_decay=weight_decay)
         return torch.optim.Adam(parameters, lr=lr)
 
-    if name == "muon":
+    if name in ("muon", "muon_rms"):
         if not hasattr(torch.optim, "Muon"):
             raise RuntimeError(
-                "optimizer 'muon' requires PyTorch >= 2.9, "
+                f"optimizer {name!r} requires PyTorch >= 2.9, "
                 "which provides torch.optim.Muon"
             )
         return MuonAdamW(
             parameters,
             lr=lr,
             weight_decay=0.0 if weight_decay is None else weight_decay,
+            rms_norm=name == "muon_rms",
         )
 
-    raise ValueError(f"Unknown optimizer {name!r}. Expected 'adam' or 'muon'.")
+    if name == "rmsprop":
+        return torch.optim.RMSprop(
+            parameters,
+            lr=lr,
+            weight_decay=0.0 if weight_decay is None else weight_decay,
+        )
+
+    if name == "amsgrad":
+        if weight_decay is not None:
+            return torch.optim.AdamW(
+                parameters, lr=lr, weight_decay=weight_decay, amsgrad=True
+            )
+        return torch.optim.Adam(parameters, lr=lr, amsgrad=True)
+
+    raise ValueError(
+        f"Unknown optimizer {name!r}. "
+        "Expected 'adam', 'amsgrad', 'muon', 'muon_rms', or 'rmsprop'."
+    )

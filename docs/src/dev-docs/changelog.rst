@@ -51,6 +51,11 @@ Added
 - Training accepts ``optimizer: muon`` for PET, SOAP-BPNN, LLPR, FlashMD,
   symplectic FlashMD, SPACE, DPA3, and the classifier. Matrix parameters are
   updated with Muon and the remaining parameters with AdamW.
+- Those same architectures also accept ``optimizer: rmsprop`` (RMSprop).
+- ``optimizer: muon_rms`` is Muon with an RMS-norm over the last dimension of
+  each orthogonalized matrix update.
+- ``optimizer: amsgrad`` uses Adam with AMSGrad, or AdamW when weight decay
+  is set.
 
 Changed
 #######
