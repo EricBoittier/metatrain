@@ -51,7 +51,8 @@ Added
 - Training accepts ``optimizer: muon`` for PET, SOAP-BPNN, LLPR, FlashMD,
   symplectic FlashMD, SPACE, DPA3, and the classifier. Hidden matrix weights
   are updated with Muon; embeddings, readout heads, conditioning parameters,
-  and every non-matrix tensor use AdamW.
+  and every non-matrix tensor use AdamW. Same-shaped matrices share one
+  Newton–Schulz iteration.
 - Those same architectures also accept ``optimizer: rmsprop`` (RMSprop).
 - ``optimizer: muon_rms`` is that same split with an RMS-norm over the last
   dimension of each orthogonalized matrix update.

@@ -287,7 +287,8 @@ class TrainerHypers(TypedDict):
     ``muon`` updates hidden matrix weights with Muon and uses AdamW for
     embeddings, readout heads, conditioning parameters, and every non-matrix
     tensor, both at ``learning_rate``. Muon uses momentum 0.95, Nesterov, and
-    RMS-matched learning-rate scaling, and requires PyTorch >= 2.9.
+    RMS-matched learning-rate scaling. Same-shaped matrices are
+    orthogonalized together.
     ``muon_rms`` is that split with an RMS-norm over the last dimension of
     each orthogonalized matrix, then scaled by ``0.2``.
     ``amsgrad`` uses Adam with AMSGrad's running maximum of the second

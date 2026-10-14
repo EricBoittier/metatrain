@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from torch.optim.lr_scheduler import LambdaLR
 
-from metatrain.utils.optimizer import MuonAdamW, MuonRMSNorm, create_optimizer
+from metatrain.utils.optimizer import Muon, MuonAdamW, MuonRMSNorm, create_optimizer
 
 
 def _tiny_module() -> nn.Module:
@@ -107,7 +107,7 @@ def test_muon_rms_differs_from_muon_and_roundtrips():
     )
     assert isinstance(rms_opt, MuonAdamW)
     assert isinstance(rms_opt._muon, MuonRMSNorm)
-    assert isinstance(muon_opt._muon, torch.optim.Muon)
+    assert type(muon_opt._muon) is Muon
     assert id(module.linear.weight) in _param_ids(rms_opt._muon)
     assert id(module.linear.bias) in _param_ids(rms_opt._adamw)
 
@@ -136,11 +136,29 @@ def test_unknown_optimizer_name():
         create_optimizer([parameter], {"optimizer": "sgd", "learning_rate": 1e-3})
 
 
-def test_muon_requires_pytorch_muon(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delattr(torch.optim, "Muon")
-    parameter = nn.Parameter(torch.zeros(2, 2))
-    with pytest.raises(RuntimeError, match="PyTorch >= 2.9"):
-        create_optimizer([parameter], {"optimizer": "muon", "learning_rate": 1e-3})
+@pytest.mark.parametrize("name", ["muon", "muon_rms"])
+def test_same_shape_matches_a_separate_step(name: str):
+    torch.manual_seed(0)
+    shapes = [(4, 16), (4, 16), (16, 4)]
+    grads = [torch.randn(*shape) for shape in shapes]
+    hypers = {"optimizer": name, "learning_rate": 0.05, "weight_decay": 0.0}
+
+    together = [nn.Parameter(torch.randn(*shape)) for shape in shapes]
+    separate = [nn.Parameter(param.detach().clone()) for param in together]
+    idle = nn.Parameter(torch.randn(4, 16))
+    idle_before = idle.detach().clone()
+    for param, grad in zip(together, grads, strict=True):
+        param.grad = grad
+    for param, grad in zip(separate, grads, strict=True):
+        param.grad = grad.clone()
+
+    create_optimizer([*together, idle], hypers).step()
+    for param in separate:
+        create_optimizer([param], hypers).step()
+
+    for batched, alone in zip(together, separate, strict=True):
+        torch.testing.assert_close(batched, alone)
+    torch.testing.assert_close(idle, idle_before)
 
 
 def test_muon_splits_parameters_steps_and_roundtrips_state():
@@ -150,7 +168,7 @@ def test_muon_splits_parameters_steps_and_roundtrips_state():
     optimizer = create_optimizer(module.parameters(), hypers)
 
     assert isinstance(optimizer, MuonAdamW)
-    assert isinstance(optimizer._muon, torch.optim.Muon)
+    assert type(optimizer._muon) is Muon
     assert isinstance(optimizer._adamw, torch.optim.AdamW)
     assert optimizer._muon.param_groups[0]["momentum"] == 0.95
     assert optimizer._muon.param_groups[0]["nesterov"] is True
