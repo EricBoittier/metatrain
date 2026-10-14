@@ -355,7 +355,7 @@ class Trainer(TrainerInterface):
             for grad, ginfo in info["gradients"].items():
                 logging.info(f"\t{name}::{grad}: {ginfo}")
 
-        optimizer = create_optimizer(model.parameters(), self.hypers)
+        optimizer = create_optimizer(model.named_parameters(), self.hypers)
 
         if self.optimizer_state_dict is not None and not is_finetune:
             # try to load the optimizer state dict, but this is only possible

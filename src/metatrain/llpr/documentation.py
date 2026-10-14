@@ -32,6 +32,7 @@ from typing import Literal, Optional
 from typing_extensions import NotRequired, TypedDict
 
 from metatrain.utils.loss import LossSpecification
+from metatrain.utils.optimizer import OptimizerName
 
 
 class ModelHypers(TypedDict):
@@ -106,15 +107,16 @@ class TrainerHypers(TypedDict):
 
     learning_rate: float = 3e-4
     """Learning rate."""
-    optimizer: Literal["adam", "amsgrad", "muon", "muon_rms", "rmsprop"] = "adam"
+    optimizer: OptimizerName = "adam"
     """Optimizer used for training.
 
     ``adam`` (default) uses Adam, or AdamW when ``weight_decay`` is set.
-    ``muon`` updates 2D parameters with Muon and every other parameter with
-    AdamW, both at ``learning_rate``. Muon uses momentum 0.95, Nesterov, and
+    ``muon`` updates hidden matrix weights with Muon and uses AdamW for
+    embeddings, readout heads, conditioning parameters, and every non-matrix
+    tensor, both at ``learning_rate``. Muon uses momentum 0.95, Nesterov, and
     RMS-matched learning-rate scaling, and requires PyTorch >= 2.9.
-    ``muon_rms`` is that Muon update with an RMS-norm over the last dimension
-    of the orthogonalized matrix, then scaled by ``0.2``.
+    ``muon_rms`` is that split with an RMS-norm over the last dimension of
+    each orthogonalized matrix, then scaled by ``0.2``.
     ``amsgrad`` uses Adam with AMSGrad's running maximum of the second
     moment, or AdamW when ``weight_decay`` is set.
     ``rmsprop`` uses RMSprop at ``learning_rate``. ``weight_decay: null``

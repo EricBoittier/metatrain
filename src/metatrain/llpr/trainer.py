@@ -300,7 +300,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 logging.info(f"\t{name}::{grad}: {ginfo}")
 
         # Create an optimizer
-        optimizer = create_optimizer(model.parameters(), self.hypers)
+        optimizer = create_optimizer(model.named_parameters(), self.hypers)
 
         if self.optimizer_state_dict is not None:
             # try to load the optimizer state dict, but this is only possible

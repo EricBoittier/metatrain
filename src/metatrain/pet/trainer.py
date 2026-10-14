@@ -365,7 +365,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
             for grad, ginfo in info["gradients"].items():
                 logging.info(f"\t{name}::{grad}: {ginfo}")
 
-        optimizer = create_optimizer(model.parameters(), self.hypers)
+        optimizer = create_optimizer(model.named_parameters(), self.hypers)
 
         if self.optimizer_state_dict is not None:
             # try to load the optimizer state dict, but this is only possible
@@ -452,6 +452,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     )
 
                 train_loss_batch.backward()
+                # Clipping runs before the optimizer step. Muon orthogonalizes
+                # its update, so the clip barely changes those groups and only
+                # shapes the AdamW groups (embeddings, readouts, biases).
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), self.hypers["grad_clip_norm"]
                 )

@@ -144,7 +144,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
         # Setup optimizer
         # The backbone parameters have requires_grad=False, so they are excluded.
-        optimizer = create_optimizer(model.parameters(), self.hypers)
+        optimizer = create_optimizer(model.named_parameters(), self.hypers)
 
         # Setup learning rate scheduler with warmup
         total_steps = len(train_dataloader) * self.hypers["num_epochs"]

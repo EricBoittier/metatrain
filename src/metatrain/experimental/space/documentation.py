@@ -77,6 +77,7 @@ from metatrain.pet.modules.finetuning import FinetuneHypers, NoFinetuneHypers
 from metatrain.scaler.documentation import FixedScalerWeights
 from metatrain.utils.hypers import init_with_defaults
 from metatrain.utils.loss import LossSpecification
+from metatrain.utils.optimizer import OptimizerName
 
 
 class RadialBasisHypers(TypedDict):
@@ -284,16 +285,17 @@ class TrainerHypers(TypedDict):
     slow or decrease it (e.g., to 0.001 or less) if you see divergence in the first
     few epochs and/or instabilities.
     """
-    optimizer: Literal["adam", "amsgrad", "muon", "muon_rms", "rmsprop"] = "adam"
+    optimizer: OptimizerName = "adam"
     """Optimizer used for training.
 
-    ``adam`` (default) uses Adam. ``muon`` updates 2D parameters with Muon
-    and every other parameter with AdamW, both at ``learning_rate``. Muon
-    uses momentum 0.95, Nesterov, and RMS-matched learning-rate scaling,
-    and requires PyTorch >= 2.9. ``muon_rms`` is that Muon update with an
-    RMS-norm over the last dimension of the orthogonalized matrix, then
-    scaled by ``0.2``. ``amsgrad`` uses Adam with AMSGrad's running maximum
-    of the second moment. ``rmsprop`` uses RMSprop at ``learning_rate``.
+    ``adam`` (default) uses Adam. ``muon`` updates hidden matrix weights with
+    Muon and uses AdamW for embeddings, readout heads, conditioning
+    parameters, and every non-matrix tensor, both at ``learning_rate``. Muon
+    uses momentum 0.95, Nesterov, and RMS-matched learning-rate scaling, and
+    requires PyTorch >= 2.9. ``muon_rms`` is that split with an RMS-norm over
+    the last dimension of each orthogonalized matrix, then scaled by ``0.2``.
+    ``amsgrad`` uses Adam with AMSGrad's running maximum of the second
+    moment. ``rmsprop`` uses RMSprop at ``learning_rate``.
     """
 
     warmup_fraction: float = 0.01

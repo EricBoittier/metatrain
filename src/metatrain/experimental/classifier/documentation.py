@@ -24,9 +24,11 @@ extract features for low-dimensional visualization and/or collective variables.
 
 """
 
-from typing import Literal, Optional
+from typing import Optional
 
 from typing_extensions import TypedDict
+
+from metatrain.utils.optimizer import OptimizerName
 
 
 class ModelHypers(TypedDict):
@@ -64,16 +66,17 @@ class TrainerHypers(TypedDict):
     """Number of training epochs."""
     learning_rate: float = 0.001
     """Learning rate for the optimizer."""
-    optimizer: Literal["adam", "amsgrad", "muon", "muon_rms", "rmsprop"] = "adam"
+    optimizer: OptimizerName = "adam"
     """Optimizer used for training.
 
-    ``adam`` (default) uses Adam. ``muon`` updates 2D parameters with Muon
-    and every other parameter with AdamW, both at ``learning_rate``. Muon
-    uses momentum 0.95, Nesterov, and RMS-matched learning-rate scaling,
-    and requires PyTorch >= 2.9. ``muon_rms`` is that Muon update with an
-    RMS-norm over the last dimension of the orthogonalized matrix, then
-    scaled by ``0.2``. ``amsgrad`` uses Adam with AMSGrad's running maximum
-    of the second moment. ``rmsprop`` uses RMSprop at ``learning_rate``.
+    ``adam`` (default) uses Adam. ``muon`` updates hidden matrix weights with
+    Muon and uses AdamW for embeddings, readout heads, conditioning
+    parameters, and every non-matrix tensor, both at ``learning_rate``. Muon
+    uses momentum 0.95, Nesterov, and RMS-matched learning-rate scaling, and
+    requires PyTorch >= 2.9. ``muon_rms`` is that split with an RMS-norm over
+    the last dimension of each orthogonalized matrix, then scaled by ``0.2``.
+    ``amsgrad`` uses Adam with AMSGrad's running maximum of the second
+    moment. ``rmsprop`` uses RMSprop at ``learning_rate``.
     """
     warmup_fraction: float = 0.1
     """Fraction of total training steps used for learning rate warmup.

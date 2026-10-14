@@ -199,6 +199,58 @@ def test_muon_weight_decay_is_shared():
     assert optimizer._adamw.param_groups[0]["weight_decay"] == 0.2
 
 
+def _role_module() -> nn.Module:
+    module = nn.Module()
+    module.hidden = nn.Linear(8, 4, bias=False)
+    module.node_embedders = nn.Linear(3, 4, bias=False)
+    module.node_last_layers = nn.Linear(4, 1, bias=False)
+    module.system_conditioning = nn.Linear(4, 4, bias=False)
+    module.bias = nn.Parameter(torch.randn(4))
+    return module
+
+
+@pytest.mark.parametrize("name", ["muon", "muon_rms"])
+def test_named_parameters_keep_readouts_off_muon(name: str):
+    module = _role_module()
+    optimizer = create_optimizer(
+        module.named_parameters(),
+        {"optimizer": name, "learning_rate": 1e-3},
+    )
+    assert isinstance(optimizer, MuonAdamW)
+    assert optimizer._muon is not None and optimizer._adamw is not None
+    muon_ids = _param_ids(optimizer._muon)
+    adamw_ids = _param_ids(optimizer._adamw)
+    assert id(module.hidden.weight) in muon_ids
+    for parameter in (
+        module.node_embedders.weight,
+        module.node_last_layers.weight,
+        module.system_conditioning.weight,
+        module.bias,
+    ):
+        assert id(parameter) in adamw_ids
+
+
+@pytest.mark.parametrize("shape", [(4, 16), (16, 4)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_muon_rms_step_matches_adam_scale(shape: tuple[int, int], dtype: torch.dtype):
+    torch.manual_seed(0)
+    lr = 0.05
+    weight = nn.Parameter(torch.randn(*shape, dtype=dtype))
+    optimizer = create_optimizer(
+        [weight],
+        {"optimizer": "muon_rms", "learning_rate": lr, "weight_decay": 0.0},
+    )
+    before = weight.detach().clone()
+    weight.grad = torch.randn_like(weight)
+    optimizer.step()
+
+    assert weight.dtype == dtype
+    delta = (weight.detach() - before).float()
+    row_rms = delta.square().mean(dim=-1).sqrt()
+    expected = torch.full_like(row_rms, 0.2 * lr)
+    torch.testing.assert_close(row_rms, expected, rtol=1e-4, atol=1e-6)
+
+
 def test_scheduled_learning_rate_reaches_both_updates():
     torch.manual_seed(0)
     module = _tiny_module()

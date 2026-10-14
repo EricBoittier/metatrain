@@ -1,20 +1,24 @@
 """Training optimizers.
 
-``adam`` keeps the historical Adam / AdamW choice. ``muon`` updates matrix
-parameters with Muon and every other parameter with AdamW, as one optimizer
-so the existing learning-rate scheduler and checkpoints still apply.
-``rmsprop`` is RMSprop, the root-mean-square gradient method.
-``muon_rms`` is Muon with an RMS-norm on the orthogonalized update.
-``amsgrad`` is Adam with the AMSGrad second-moment maximum.
+``adam`` keeps the historical Adam / AdamW choice. ``muon`` updates hidden
+matrix weights with Muon, and embeddings, readouts, conditioning parameters,
+and every non-matrix tensor with AdamW, as one optimizer so the existing
+learning-rate scheduler and checkpoints still apply. ``rmsprop`` is RMSprop,
+the root-mean-square gradient method. ``muon_rms`` is that same split with an
+RMS-norm on the orthogonalized update. ``amsgrad`` is Adam with the AMSGrad
+second-moment maximum.
 """
 
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any, Optional
+from typing import Any, Literal, Optional, get_args
 
 import torch
 from torch import Tensor
 from torch.nn import functional as F
 
+
+OptimizerName = Literal["adam", "amsgrad", "muon", "muon_rms", "rmsprop"]
+OPTIMIZER_NAMES: tuple[OptimizerName, ...] = get_args(OptimizerName)
 
 _MUON_MOMENTUM = 0.95
 _MUON_ADJUST_LR = "match_rms_adamw"
@@ -24,19 +28,29 @@ _MUON_NS_EPS = 1e-7
 # Once each row has unit RMS, 0.2 puts the update on an Adam-like scale.
 _MUON_RMS_LR_SCALE = 0.2
 _MUON_RMS_EPS = 1e-8
+# Hidden matrices use Muon. These substrings stay on AdamW: embedding tables
+# (``embedd``), readout heads (``last_layer``), and the conditioning module,
+# whose output gate sets a residual scale.
+_ADAMW_NAME_MARKERS = ("embedd", "last_layer", "system_conditioning")
 
 
 def _orthogonalize(update: Tensor) -> Tensor:
-    # Same Newton-Schulz iteration as torch.optim.Muon.
-    from torch.optim import _muon as muon_impl
-
-    orthogonalize = getattr(muon_impl, "_zeropower_via_newtonschulz", None)
-    if orthogonalize is None:
-        raise RuntimeError(
-            "optimizer 'muon_rms' requires PyTorch >= 2.9, "
-            "which provides torch.optim.Muon"
-        )
-    return orthogonalize(update, _MUON_NS_COEFFICIENTS, _MUON_NS_STEPS, _MUON_NS_EPS)
+    # Quintic Newton-Schulz iteration from Keller Jordan's Muon. Tall matrices
+    # are transposed so the Gram matrix is the smaller side, then transposed
+    # back. bf16 is used on CUDA only; CPU stays in the update dtype.
+    a, b, c = _MUON_NS_COEFFICIENTS
+    ortho = update.bfloat16() if update.is_cuda else update
+    transposed = ortho.size(0) > ortho.size(1)
+    if transposed:
+        ortho = ortho.T
+    ortho = ortho / ortho.norm().clamp(min=_MUON_NS_EPS)
+    for _ in range(_MUON_NS_STEPS):
+        gram = ortho @ ortho.T
+        gram_update = torch.addmm(gram, gram, gram, beta=b, alpha=c)
+        ortho = torch.addmm(ortho, gram_update, ortho, beta=a)
+    if transposed:
+        ortho = ortho.T
+    return ortho
 
 
 def _as_float(value: float | Tensor) -> float:
@@ -117,21 +131,23 @@ class MuonRMSNorm(torch.optim.Optimizer):
                     update.float(), (update.shape[-1],), eps=_MUON_RMS_EPS
                 )
                 param.mul_(1 - lr * weight_decay)
-                param.add_(update, alpha=-_MUON_RMS_LR_SCALE * lr)
+                param.add_(update.to(dtype=param.dtype), alpha=-_MUON_RMS_LR_SCALE * lr)
         return loss
 
 
 class MuonAdamW(torch.optim.Optimizer):
-    """Muon for 2D parameters and AdamW for every other rank.
+    """Muon for hidden matrices and AdamW for everything else.
 
-    PyTorch's Muon optimizer only accepts matrices. Biases, gains, and
-    higher-rank tensors are updated with AdamW at the same learning rate.
+    Hidden 2D weights use Muon. Embeddings, readout heads, conditioning
+    parameters, and every non-matrix tensor use AdamW at the same learning
+    rate. Name checks look for ``embedd``, ``last_layer``, and
+    ``system_conditioning``; unnamed tensors fall back to the rank rule.
     Parameter groups are tagged with ``role`` (``"muon"`` or ``"adamw"``).
     :meth:`step` copies each group's learning rate onto the matching inner
     optimizer, so a scheduler attached to this object covers both updates.
 
-    :param params: Parameters to optimize. Matrices (``ndim == 2``) use Muon;
-        every other rank uses AdamW.
+    :param params: Parameters to optimize, or ``(name, parameter)`` pairs
+        from ``module.named_parameters()``.
     :param lr: Learning rate applied to both groups before scheduling.
     :param weight_decay: Decoupled weight decay applied to both groups.
     :param rms_norm: When true, matrix updates use :class:`MuonRMSNorm`
@@ -140,14 +156,18 @@ class MuonAdamW(torch.optim.Optimizer):
 
     def __init__(
         self,
-        params: Iterable[Tensor],
+        params: Iterable[Tensor | tuple[str, Tensor]],
         lr: float,
         weight_decay: float,
         rms_norm: bool = False,
     ) -> None:
-        param_list = list(params)
-        muon_params = [param for param in param_list if param.ndim == 2]
-        adamw_params = [param for param in param_list if param.ndim != 2]
+        named = _as_named_parameters(params)
+        muon_params = [
+            param for name, param in named if _is_muon_parameter(name, param)
+        ]
+        adamw_params = [
+            param for name, param in named if not _is_muon_parameter(name, param)
+        ]
         if len(muon_params) == 0 and len(adamw_params) == 0:
             raise ValueError("optimizer got an empty parameter list")
 
@@ -232,6 +252,29 @@ class MuonAdamW(torch.optim.Optimizer):
         _restore_inner(self._adamw, state_dict["adamw"], "adamw")
 
 
+def _as_named_parameters(
+    parameters: Iterable[Tensor | tuple[str, Tensor]],
+) -> list[tuple[Optional[str], Tensor]]:
+    named: list[tuple[Optional[str], Tensor]] = []
+    for item in parameters:
+        if isinstance(item, Tensor):
+            named.append((None, item))
+        else:
+            name, param = item
+            named.append((name, param))
+    return named
+
+
+def _is_muon_parameter(name: Optional[str], param: Tensor) -> bool:
+    # Unnamed 2D tensors are treated as hidden weights. Named embeddings,
+    # readouts, and conditioning parameters stay with AdamW.
+    if param.ndim != 2:
+        return False
+    if name is None:
+        return True
+    return not any(marker in name for marker in _ADAMW_NAME_MARKERS)
+
+
 def _restore_inner(
     inner: Optional[torch.optim.Optimizer],
     saved: Any,
@@ -247,20 +290,22 @@ def _restore_inner(
 
 
 def create_optimizer(
-    parameters: Iterable[Tensor],
+    parameters: Iterable[Tensor | tuple[str, Tensor]],
     hypers: Mapping[str, Any],
 ) -> torch.optim.Optimizer:
     """Create the optimizer selected by the training hyperparameters.
 
     ``adam`` (the default) matches the historical behavior: Adam, or AdamW
-    when ``weight_decay`` is set. ``muon`` uses :class:`MuonAdamW`.
-    ``rmsprop`` uses :class:`torch.optim.RMSprop`. ``muon_rms`` uses
-    :class:`MuonRMSNorm` for matrix parameters. ``amsgrad`` uses Adam with
-    ``amsgrad=True``, or AdamW when ``weight_decay`` is set. A missing
-    ``weight_decay`` means no decay; for Muon, Muon RMS-norm, and RMSprop
-    that is ``0.0`` rather than PyTorch's own Muon default of ``0.1``.
+    when ``weight_decay`` is set. ``muon`` and ``muon_rms`` use
+    :class:`MuonAdamW`. ``rmsprop`` uses :class:`torch.optim.RMSprop`.
+    ``amsgrad`` uses Adam with ``amsgrad=True``, or AdamW when
+    ``weight_decay`` is set. A missing ``weight_decay`` means no decay; for
+    Muon, Muon RMS-norm, and RMSprop that is ``0.0`` rather than PyTorch's
+    own Muon default of ``0.1``.
 
-    :param parameters: Model parameters, as from ``module.parameters()``.
+    :param parameters: Model parameters, or ``(name, parameter)`` pairs from
+        ``module.named_parameters()``. Names are used to keep embeddings,
+        readouts, and conditioning off Muon.
     :param hypers: Training hyperparameters. Reads ``optimizer``,
         ``learning_rate``, and optional ``weight_decay``.
     :return: The optimizer to step during training.
@@ -269,20 +314,22 @@ def create_optimizer(
     lr = float(hypers["learning_rate"])
     decay = hypers.get("weight_decay")
     weight_decay = None if decay is None else float(decay)
+    named = _as_named_parameters(parameters)
+    tensors = [param for _, param in named]
 
     if name == "adam":
         if weight_decay is not None:
-            return torch.optim.AdamW(parameters, lr=lr, weight_decay=weight_decay)
-        return torch.optim.Adam(parameters, lr=lr)
+            return torch.optim.AdamW(tensors, lr=lr, weight_decay=weight_decay)
+        return torch.optim.Adam(tensors, lr=lr)
 
     if name in ("muon", "muon_rms"):
-        if not hasattr(torch.optim, "Muon"):
+        if name == "muon" and not hasattr(torch.optim, "Muon"):
             raise RuntimeError(
-                f"optimizer {name!r} requires PyTorch >= 2.9, "
+                "optimizer 'muon' requires PyTorch >= 2.9, "
                 "which provides torch.optim.Muon"
             )
         return MuonAdamW(
-            parameters,
+            named,
             lr=lr,
             weight_decay=0.0 if weight_decay is None else weight_decay,
             rms_norm=name == "muon_rms",
@@ -290,7 +337,7 @@ def create_optimizer(
 
     if name == "rmsprop":
         return torch.optim.RMSprop(
-            parameters,
+            tensors,
             lr=lr,
             weight_decay=0.0 if weight_decay is None else weight_decay,
         )
@@ -298,11 +345,9 @@ def create_optimizer(
     if name == "amsgrad":
         if weight_decay is not None:
             return torch.optim.AdamW(
-                parameters, lr=lr, weight_decay=weight_decay, amsgrad=True
+                tensors, lr=lr, weight_decay=weight_decay, amsgrad=True
             )
-        return torch.optim.Adam(parameters, lr=lr, amsgrad=True)
+        return torch.optim.Adam(tensors, lr=lr, amsgrad=True)
 
-    raise ValueError(
-        f"Unknown optimizer {name!r}. "
-        "Expected 'adam', 'amsgrad', 'muon', 'muon_rms', or 'rmsprop'."
-    )
+    expected = ", ".join(repr(allowed) for allowed in OPTIMIZER_NAMES)
+    raise ValueError(f"Unknown optimizer {name!r}. Expected one of: {expected}.")
