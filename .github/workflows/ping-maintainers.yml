@@ -1,0 +1,41 @@
+name: Ping architecture maintainers
+
+on:
+  # pull_request_target gives a write token on PRs from forks, so this workflow
+  # must never check out or run code from the PR itself
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  ping:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Find maintainers of the modified architectures
+      id: find
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR: ${{ github.event.pull_request.number }}
+        AUTHOR: ${{ github.event.pull_request.user.login }}
+      run: |
+        gh pr diff "$PR" --repo "$GITHUB_REPOSITORY" --name-only > changed.txt
+        python developer/find_maintainers.py changed.txt "$AUTHOR" > comment.md
+        if grep -q . comment.md; then echo "found=true" >> "$GITHUB_OUTPUT"; fi
+
+    - name: Mention maintainers
+      if: steps.find.outputs.found == 'true'
+      uses: marocchino/sticky-pull-request-comment@v2
+      with:
+        header: architecture-maintainers
+        path: comment.md
+
+    - name: Remove outdated mention
+      if: steps.find.outputs.found != 'true'
+      uses: marocchino/sticky-pull-request-comment@v2
+      with:
+        header: architecture-maintainers
+        delete: true
