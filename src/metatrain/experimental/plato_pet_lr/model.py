@@ -79,8 +79,9 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
             mapping[z] = i
         self.register_buffer("species_to_species_index", mapping)
 
-        G = platonic_group(str(h["frames"]))
-        I3 = platonic_group("identity")
+        dt = torch.get_default_dtype()  # buffers follow the parameters
+        G = platonic_group(str(h["frames"])).to(dt)
+        I3 = platonic_group("identity").to(dt)
         self.register_buffer("G_R", G)
         self.register_buffer("G_rel", relative_rotations(G))
         self.register_buffer(
