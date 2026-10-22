@@ -26,6 +26,7 @@ jobs:
           - dpa3
           - scaler
           - lorem
+          - plato-pet-lr
 
     runs-on: ubuntu-24.04
 

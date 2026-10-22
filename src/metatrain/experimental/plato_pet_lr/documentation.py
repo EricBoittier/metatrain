@@ -1,0 +1,212 @@
+"""
+Plato-PET-LR (Experimental)
+===========================
+
+A PET backbone whose tokens carry ``F`` rotation frames, from a Platonic group
+(``T``, ``O``, ``I``: 12, 24, 60 frames) or a single identity frame. Every linear map
+is a ``FrameLinear``, a learned continuous kernel on SO(3) over frame pairs, so the
+model is exactly invariant under the group and approximately under SO(3). Attention
+over a centre's neighbours uses rotary encodings of ``r_ij`` in each frame and a
+``log f_c`` cutoff bias. Long range: a learned particle-mesh coupling of the tokens
+after one layer, and an energy of latent (LES) charges with a converged Ewald sum.
+Energies, forces and stress (by autograd).
+
+{{SECTION_INSTALLATION}}
+
+{{SECTION_DEFAULT_HYPERS}}
+
+{{SECTION_MODEL_HYPERS}}
+
+"""
+
+from typing import Literal, Optional
+
+from typing_extensions import NotRequired, TypedDict
+
+from metatrain.composition.documentation import FixedCompositionWeights
+from metatrain.scaler.documentation import FixedScalerWeights
+from metatrain.utils.loss import LossSpecification
+
+
+###########################
+#  MODEL HYPERPARAMETERS  #
+###########################
+
+
+class ModelHypers(TypedDict):
+    """Hyperparameters for the experimental Plato-PET-LR model."""
+
+    cutoff: float = 5.0
+    """Neighbour cutoff radius; ``(1 - (r / r_c)^2)^3`` goes to zero there."""
+    d_model: int = 64
+    """Token width per frame."""
+    num_heads: int = 4
+    """Attention heads. ``d_model / num_heads`` must be even (RoPE)."""
+    num_layers: int = 4
+    """Number of PET layers (each one is a message-passing step)."""
+    num_rbf: int = 16
+    """Gaussian radial basis functions of the edge embedding."""
+    frames: Literal["identity", "T", "O", "I"] = "T"
+    """Frame group. ``identity`` is one frame: no frame machinery, not invariant."""
+    num_framed_layers: Optional[int] = None
+    """Layers that carry frames (all when ``None``). After them the tokens are
+    averaged over the frames, and the remaining layers run with one frame and
+    without RoPE, which keeps the group invariance."""
+    frame_sampling: Literal["fixed", "coset", "haar"] = "fixed"
+    """Frames during training: the group, a random coset ``Q G`` (a random global
+    rotation), or ``F`` Haar-random rotations. Evaluation always uses the group."""
+    n_basis: int = 8
+    """Basis functions of each ``FrameLinear`` kernel."""
+    kernel_hidden: int = 32
+    """Hidden width of the kernel MLP on ``R_i^T R_j``."""
+    frame_linear_mode: Literal["auto", "folded", "factored"] = "auto"
+    """Contraction order of ``FrameLinear``; ``auto`` takes the fewer FLOPs."""
+    rope: bool = True
+    """Rotary encoding of ``r_ij`` (in each frame) on queries and keys."""
+    rope_max_freq: float = 3.0
+    """Largest RoPE wavenumber, in inverse length units."""
+    mesh_coupling: bool = True
+    """Learned PME coupling of the tokens (periodic systems only)."""
+    couple_at: int = 1
+    """Index of the layer after which the mesh coupling is applied."""
+    mesh_channels: int = 8
+    """Channels per frame carried to the mesh."""
+    mesh_spacing: float = 1.0
+    """Mesh spacing; the mesh has ``ceil(|a_i| / spacing)`` points per cell vector."""
+    mesh_sigma: float = 1.5
+    """Gaussian width of the mesh filter."""
+    les: bool = True
+    """Energy of learned latent charges (LES)."""
+    num_charges: int = 1
+    """Latent charge channels."""
+    les_sigma: float = 1.0
+    """Width of the Gaussian latent charges."""
+    les_kcut: float = 6.0
+    """Reciprocal cutoff in units of ``1 / les_sigma``; a cosine window over the
+    last ``1 / les_sigma`` keeps the energy smooth under strain."""
+    seed: int = 0
+    """Seed of the RoPE directions."""
+
+
+##############################
+#  TRAINER HYPERPARAMETERS   #
+##############################
+
+
+class TrainerHypers(TypedDict):
+    """Hyperparameters for training Plato-PET-LR models."""
+
+    distributed: NotRequired[bool]
+    """Whether to use distributed training. When not set, distributed training
+    is enabled automatically when running under more than one SLURM task.
+    Setting this option explicitly is deprecated."""
+    distributed_port: int = 39591
+    """Port for DDP communication."""
+    batch_size: int = 8
+    """The number of samples to use in each batch of training. This
+    hyperparameter controls the tradeoff between training speed and memory usage. In
+    general, larger batch sizes will lead to faster training, but might require more
+    memory."""
+    max_atoms_per_batch: Optional[int] = None
+    """If set, use greedy atom-count packing instead of fixed ``batch_size``.
+    Structures are accumulated into each batch until adding another would exceed this
+    limit, producing variable numbers of structures per batch. Supported with any
+    dataset type. When set, ``batch_size`` is ignored for constructing training
+    and validation batches (it is still used internally for composition model and
+    scaler fitting)."""
+    min_atoms_per_batch: int = 0
+    """Minimum total number of atoms required to keep a batch when
+    ``max_atoms_per_batch`` is set. Batches whose total atom count falls below this
+    threshold are discarded during packing. Defaults to ``0`` (no minimum)."""
+    num_epochs: int = 100
+    """Number of epochs."""
+    warmup_fraction: float = 0.01
+    """Fraction of training steps used for learning rate warmup, before the
+    cosine decay."""
+    learning_rate: float = 0.001
+    """Learning rate."""
+    weight_decay: Optional[float] = None
+    """Weight decay. If set, AdamW is used instead of Adam."""
+
+    log_interval: int = 1
+    """Interval to log metrics."""
+    checkpoint_interval: int = 100
+    """Interval to save checkpoints."""
+    scale_targets: bool = True
+    """
+    Normalize targets to unit std during training.
+
+    If true, a single scale is computed for each target, given by the uncentered
+    standard deviation across all values in the dataset for that target.
+
+    For targets with more than one property (i.e. > 1 block or >= 1 block with > 1
+    property), per-property scales are also computed, and used to re-scale model
+    predictions.
+
+    See also :ref:`scale-targets`.
+    """
+    atomic_baseline: FixedCompositionWeights | str = {}
+    """The baselines for each target.
+
+    By default, ``metatrain`` fits a linear model (:class:`CompositionModel
+    <metatrain.composition.CompositionModel>`) to compute the least-squares
+    baseline for each atomic species for each target.
+
+    This hyperparameter instead lets you provide those baselines, either as a
+    dictionary or as a path to a pre-trained composition model checkpoint:
+
+    - a dictionary whose keys are target names, and whose values are either
+      one baseline for every atomic type, or a dictionary mapping atomic types
+      to baselines.
+    - a string path to a ``.ckpt`` file from a pre-trained composition model.
+
+    For example:
+
+    - ``atomic_baseline: {"energy": {1: -0.5, 6: -10.0}}`` fixes the energy
+      baseline for hydrogen (Z=1) to -0.5 and for carbon (Z=6) to -10.0, and
+      fits the rest.
+    - ``atomic_baseline: {"energy": -5.0}`` fixes the energy baseline for
+      every atomic type to -5.0.
+    - ``atomic_baseline: {"mtt:dos": 0.0}`` sets that target's baseline to
+      0.0, which disables the atomic baseline for it.
+    - ``atomic_baseline: "/path/to/model.ckpt"`` loads a pre-trained
+      composition model checkpoint instead of fitting one.
+
+    The baseline is subtracted from the targets during training and added
+    back at evaluation. It is a per-atom contribution, so for a per-structure
+    target such as the total energy it is multiplied by the number of atoms
+    of that type.
+    """
+    fixed_scaling_weights: FixedScalerWeights | str = {}
+    """Weights for target scaling.
+
+    This is passed to the ``fixed_weights`` argument of
+    :meth:`Scaler.train_model <metatrain.scaler.Scaler.train_model>`,
+    see its documentation to understand exactly what to pass here.
+
+    A path to a model checkpoint is also accepted. If that checkpoint is a
+    Scaler model, the pre-trained scaler is loaded. When passing a checkpoint
+    for the scaler, ``atomic_baseline`` must also be a checkpoint for a
+    composition model.
+    """
+    per_structure_targets: list[str] = []
+    """Targets to calculate per-structure losses."""
+    num_workers: Optional[int] = None
+    """Number of workers for data loading. If not provided, it is set
+    automatically."""
+    log_mae: bool = False
+    """Log MAE alongside RMSE."""
+    log_separate_blocks: bool = False
+    """Log per-block error."""
+    best_model_metric: Literal["rmse_prod", "mae_prod", "loss"] = "rmse_prod"
+    """Metric used to select best checkpoint (e.g., ``rmse_prod``)."""
+    grad_clip_norm: float = 1.0
+    """Maximum gradient norm value."""
+
+    rotational_augmentation: bool = True
+    """Random O(3) rotations/inversions of each training structure, as PET does.
+    Platonic frames make the model exactly invariant only under its group."""
+
+    loss: str | dict[str, LossSpecification | str] = "mse"
+    """This section describes the loss function to be used. See the
+    :ref:`loss-functions` for more details."""
