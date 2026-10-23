@@ -73,3 +73,23 @@ class TestTraining(TrainingTests, PlatoTests):
 
 class TestCheckpoints(CheckpointTests, PlatoTests):
     incompatible_trainer_checkpoints = []
+
+
+class PlatoChiTests(PlatoTests):
+    """The same model with the linear electronegativity term."""
+
+    @pytest.fixture
+    def model_hypers(self) -> dict:
+        return {**_minimal_hypers(self.architecture), "electronegativity": "linear"}
+
+
+class TestAutogradChi(AutogradTests, PlatoChiTests):
+    cuda_nondet_tolerance = 1e-12
+
+
+class TestTorchscriptChi(TorchscriptTests, PlatoChiTests):
+    float_hypers = ["cutoff"]
+    supports_spherical_outputs = False
+
+
+class TestExportedChi(ExportedTests, PlatoChiTests): ...

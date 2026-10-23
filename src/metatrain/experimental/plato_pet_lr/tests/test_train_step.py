@@ -59,6 +59,7 @@ def _energy_map(index: int, n_atoms: int, volume: float) -> TensorMap:
         dict(frames="D2", frame_mode="attention", frame_sampling="coset"),
         dict(frames="T", frame_mode="attention", num_framed_layers=1),
         dict(frames="D2", num_framed_layers=1, n_basis=1),
+        dict(frames="D2", frame_mode="attention", electronegativity="linear"),
     ],
 )
 def test_one_training_step(variant, tmp_path, monkeypatch):
@@ -119,3 +120,7 @@ def test_one_training_step(variant, tmp_path, monkeypatch):
     ]
     assert any(k.startswith("layers.0.") for k in changed)
     assert all(torch.isfinite(p).all() for p in model.parameters())
+    for chi in model.electronegativity:  # chi0 and the dchi head train
+        assert "electronegativity.0.chi0" in changed
+        assert "electronegativity.0.head.l2.W" in changed
+        assert float(chi.charge_unit) != 1.0  # sqrt of the fitted energy scale

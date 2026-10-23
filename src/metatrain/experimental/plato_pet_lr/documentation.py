@@ -96,6 +96,18 @@ class ModelHypers(TypedDict):
     """Latent charge channels."""
     les_sigma: float = 1.0
     """Width of the Gaussian latent charges."""
+    electronegativity: Literal["none", "linear"] = "none"
+    """Energy linear in the latent charges, ``sum_i chi_i q_i`` (needs ``les``).
+    The LES energy is even in ``q``, so without it the sign of the latent charges
+    is arbitrary (``q`` and ``-q`` fit equally well). ``linear``: ``chi_i =
+    chi0[Z_i] + dchi_i``, a learnable per-element table in eV / e started from the
+    QEq electronegativities of Rappe & Goddard (1991) (H 4.528, C 5.343, N 6.899,
+    O 8.741, S 6.928, ...; elements without a value start at the mean), plus a
+    per-atom correction from the final features that starts at zero. It acts on
+    the first charge channel. Charges are in ``e`` with ``q = sqrt(s) q_m``, ``s``
+    the energy scale of the scaler (stored as ``charge_unit`` when training
+    starts), so ``KE q^2 / r`` and ``chi q`` are both in eV. ``chi0`` is fixed only
+    up to a common shift (the latent charges are neutral per structure)."""
     les_kcut: float = 6.0
     """Reciprocal cutoff in units of ``1 / les_sigma``; a cosine window over the
     last ``1 / les_sigma`` keeps the energy smooth under strain."""

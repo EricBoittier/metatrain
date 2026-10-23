@@ -31,13 +31,14 @@ from metatrain.utils.sum_over_atoms import sum_over_atoms
 
 from . import checkpoints
 from .documentation import ModelHypers
+from .modules.electronegativity import Electronegativity
 from .modules.ewald import les_energy
 from .modules.frames import platonic_group, relative_rotations, sample_frames
 from .modules.layers import EdgeEmbed, FrameMLP, MeshCoupling, PETLayer, cutoff_fn
 
 
 class PlatoPETLR(ModelInterface[ModelHypers]):
-    __checkpoint_version__ = 2
+    __checkpoint_version__ = 3
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -117,6 +118,17 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
         )  # fmt: skip
         self.energy_head = FrameMLP(d, 1, nb, hid, mode)
         self.charge_head = FrameMLP(d, int(h["num_charges"]), nb, hid, mode)
+        chi_mode = str(h["electronegativity"])
+        if chi_mode not in ("none", "linear"):
+            raise ValueError(f"unknown electronegativity '{chi_mode}'")
+        if chi_mode == "linear" and not self.use_les:
+            raise ValueError("electronegativity 'linear' needs les: true")
+        # empty unless 'linear', so 'none' models keep their state dict
+        self.electronegativity = torch.nn.ModuleList(
+            [Electronegativity(self.atomic_types, d, nb, hid, mode)]
+            if chi_mode == "linear"
+            else []
+        )
 
         self.outputs: Dict[str, ModelOutput] = {}
         self.layouts = {}
@@ -208,10 +220,12 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
         if self.use_les:
             q_all = (self.charge_head(h, rel, w) * w[:, None]).sum(-2)
             e_lr: List[torch.Tensor] = []
+            q_neutral: List[torch.Tensor] = []
             start = 0
             for s, n in enumerate(sizes):
                 q = q_all[start : start + n]
                 q = q - q.mean(0, keepdim=True)
+                q_neutral.append(q)
                 pos = positions[start : start + n]
                 e_lr.append(
                     les_energy(
@@ -220,6 +234,9 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
                 )
                 start += n
             e = e + torch.cat(e_lr)
+            q0 = torch.cat(q_neutral)[:, 0]
+            for chi in self.electronegativity:
+                e = e + chi(h, sp_center, q0, rel, w)
         return e
 
     def forward(

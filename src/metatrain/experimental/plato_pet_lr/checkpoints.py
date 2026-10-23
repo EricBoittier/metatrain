@@ -8,3 +8,11 @@ def model_update_v1_v2(checkpoint: dict) -> None:
     :param checkpoint: The checkpoint to update in place.
     """
     checkpoint["model_data"]["model_hypers"].setdefault("frame_mode", "full")
+
+
+def model_update_v2_v3(checkpoint: dict) -> None:
+    """v3 adds the ``electronegativity`` hyper; v2 models have none.
+
+    :param checkpoint: The checkpoint to update in place.
+    """
+    checkpoint["model_data"]["model_hypers"].setdefault("electronegativity", "none")

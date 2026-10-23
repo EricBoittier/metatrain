@@ -44,6 +44,7 @@ from metatrain.utils.scaler import get_remove_scale_transform
 from metatrain.utils.transfer import batch_to
 
 from . import checkpoints
+from .convert import set_charge_unit
 from .documentation import TrainerHypers
 from .model import PlatoPETLR
 
@@ -172,6 +173,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 checkpoint_dir=checkpoint_dir,
                 per_structure_targets=self.hypers["per_structure_targets"],
             )
+
+        if self.epoch is None:  # a new run: charges in e are sqrt(s) q_m
+            set_charge_unit(model)
 
         logging.info("Setting up data loaders")
 
