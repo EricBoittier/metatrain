@@ -56,6 +56,9 @@ def _energy_map(index: int, n_atoms: int, volume: float) -> TensorMap:
         dict(frames="T", frame_sampling="coset"),
         dict(frames="T", num_framed_layers=1, frame_sampling="haar"),
         dict(frames="identity", les=False, mesh_coupling=False),
+        dict(frames="D2", frame_mode="attention", frame_sampling="coset"),
+        dict(frames="T", frame_mode="attention", num_framed_layers=1),
+        dict(frames="D2", num_framed_layers=1, n_basis=1),
     ],
 )
 def test_one_training_step(variant, tmp_path, monkeypatch):
@@ -79,10 +82,9 @@ def test_one_training_step(variant, tmp_path, monkeypatch):
         length_unit="angstrom", atomic_types=[1, 8], targets={"energy": target}
     )
     hypers = copy.deepcopy(get_default_hypers("experimental.plato_pet_lr"))
-    hypers["model"].update(
-        d_model=8, num_heads=2, num_layers=2, n_basis=2, kernel_hidden=4,
-        mesh_channels=1, mesh_spacing=1.5, **variant,
-    )  # fmt: skip
+    small = dict(d_model=8, num_heads=2, num_layers=2, n_basis=2, kernel_hidden=4,
+                 mesh_channels=1, mesh_spacing=1.5)  # fmt: skip
+    hypers["model"].update({**small, **variant})
     model = PlatoPETLR(hypers["model"], info)
     before = copy.deepcopy(model.state_dict())
 

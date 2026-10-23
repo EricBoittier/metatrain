@@ -106,13 +106,19 @@ class EdgeEmbed(torch.nn.Module):
         sp_center: torch.Tensor,
         sp_nbr: torch.Tensor,
         R: torch.Tensor,
+        frame_w: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """``(A, K1, F, d)`` tokens, or with ``frame_w`` one group-invariant frame
+        ``(A, K1, 1, d)``: the direction enters as ``sum_f w_f SiLU(W R_f^T r)``."""
         r_f = torch.einsum("fji,akj->akfi", R, r)  # r in each frame, R_f^T r
         inv = (
             self.rad(rbf(d, self.rc, self.n_rbf))
             + self.sp_nbr(sp_nbr)
             + self.sp_center(sp_center)[:, None]
         )
+        if frame_w is not None:
+            v = (Fn.silu(self.vec(r_f)) * frame_w[:, None]).sum(-2, keepdim=True)
+            return v + inv[:, :, None]
         return self.vec(r_f) + inv[:, :, None]
 
 
@@ -126,9 +132,35 @@ def attention(
     return torch.softmax(a, -1) @ v
 
 
+def frame_averaged_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    ang: torch.Tensor,
+    frame_w: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    """Attention-only frames: ``sum_f w_f softmax(RoPE_f(q) RoPE_f(k)^T + bias) v``.
+
+    ``q, k, v`` are ``(A, K1, H, Ch)``, shared by the frames; ``ang`` is
+    ``(A, K1, F, 1, Ch / 2)``. A group element permutes the frames, so the average
+    is group invariant. Averaging the attention weights before ``@ v`` equals
+    averaging the outputs, and ``@ v`` runs once. Returns ``(A, H, K1, Ch)``.
+    """
+    q = apply_rope(q[:, :, None], ang).permute(0, 2, 3, 1, 4)  # (A, F, H, K1, Ch)
+    k = apply_rope(k[:, :, None], ang).permute(0, 2, 3, 1, 4)
+    a = q @ k.transpose(-1, -2) / math.sqrt(q.shape[-1]) + bias[:, None]
+    p = (torch.softmax(a, -1) * frame_w[:, None, None, None]).sum(1)
+    return p @ v.transpose(1, 2)
+
+
 class PETLayer(torch.nn.Module):
     """Edge-reversal merge, self-attention over a centre's tokens (RoPE on r_ij,
-    ``log f_c`` bias), MLP; every linear map is a ``FrameLinear``."""
+    ``log f_c`` bias), MLP; every linear map is a ``FrameLinear``.
+
+    With ``frame_w`` (attention-only frames) the tokens have one frame, every
+    linear map runs once, and the frames enter only through the RoPE angles ``ang``
+    (see :func:`frame_averaged_attention`)."""
 
     def __init__(self, d: int, heads: int, n_basis: int, hidden: int, mode: str):
         super().__init__()
@@ -151,6 +183,7 @@ class PETLayer(torch.nn.Module):
         bias: torch.Tensor,
         rev: torch.Tensor,
         manual: bool,
+        frame_w: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         A, K1, F, d = tok.shape
         H = self.h
@@ -159,6 +192,17 @@ class PETLayer(torch.nn.Module):
         t_rev = t.reshape(A * K1, F, d).index_select(0, rev).reshape(A, K1, F, d)
         x = tok + self.merge(torch.cat([t, t_rev], -1), rel, w)
         q, k, v = self.qkv(self.n1(x), rel, w).chunk(3, -1)
+        if frame_w is not None and ang is not None:
+            o = frame_averaged_attention(
+                q.reshape(A, K1, H, Ch),
+                k.reshape(A, K1, H, Ch),
+                v.reshape(A, K1, H, Ch),
+                ang,
+                frame_w,
+                bias,
+            )
+            x = x + self.proj(o.transpose(1, 2).reshape(A, K1, 1, d), rel, w)
+            return x + self.mlp2(Fn.silu(self.mlp1(self.n2(x), rel, w)), rel, w)
         q = q.reshape(A, K1, F, H, Ch)
         k = k.reshape(A, K1, F, H, Ch)
         if ang is not None:

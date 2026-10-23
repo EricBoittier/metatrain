@@ -23,6 +23,14 @@ Training uses O(3) augmentation (`rotational_augmentation`) like PET; with
 `num_framed_layers` averages the tokens over the frames after that many layers; the
 rest run with one frame and no RoPE (so the group invariance is kept).
 
+`frame_mode: attention` (`PETLayer` with `frame_w`, `frame_averaged_attention`):
+the tokens have one frame and every `FrameLinear` runs with `F = 1` (a plain
+linear map); only the RoPE angles `r_ij . R_f omega` use the `F` group frames,
+the softmax weights are averaged over frames before `@ v`, and the edge
+embedding's direction term is `sum_f w_f SiLU(W R_f^T r)`. Group invariance is
+exact because a group element permutes the frames. Smaller groups: `D2` (4, a
+subgroup of `T`), `C3`, `D3`.
+
 Not here (from the reference): the direct short-range force fork with two-stage
 training, Born effective charges, and the MTS integrator.
 

@@ -1,4 +1,4 @@
-"""Rotation frames: Platonic groups (T, O, I) and Haar samples.
+"""Rotation frames: point groups (C3, D2, D3, T, O, I) and Haar samples.
 
 Called once at construction (or per step for random frames). Not scripted.
 """
@@ -61,13 +61,22 @@ def _closure(gens) -> torch.Tensor:
 
 
 def platonic_group(name: str) -> torch.Tensor:
-    """Rotation matrices of a Platonic group: identity (1), T (12), O (24), I (60)."""
+    """Rotation matrices of a point group: identity (1), C3 (3, about [111]), D2 (4,
+    the Klein four-group of diagonal sign flips, a subgroup of T), D3 (6), T (12),
+    O (24), I (60)."""
     if name == "identity":
         return torch.eye(3, dtype=torch.float64)[None]
     c3 = torch.tensor(
         [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=torch.float64
     )
     c2 = torch.diag(torch.tensor([-1.0, -1.0, 1.0], dtype=torch.float64))
+    if name == "C3":
+        return _closure([c3])
+    if name == "D2":
+        c2x = torch.diag(torch.tensor([1.0, -1.0, -1.0], dtype=torch.float64))
+        return _closure([c2x, c2])
+    if name == "D3":
+        return _closure([c3, axis_angle([1, -1, 0], math.pi)])
     if name == "T":
         return _closure([c3, c2])
     if name == "O":
@@ -108,9 +117,5 @@ def sample_frames(
     )
 
 
-assert [platonic_group(n).shape[0] for n in ("identity", "T", "O", "I")] == [
-    1,
-    12,
-    24,
-    60,
-]
+GROUP_ORDERS = {"identity": 1, "C3": 3, "D2": 4, "D3": 6, "T": 12, "O": 24, "I": 60}
+assert {n: platonic_group(n).shape[0] for n in GROUP_ORDERS} == GROUP_ORDERS

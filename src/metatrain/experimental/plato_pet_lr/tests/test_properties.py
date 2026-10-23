@@ -68,13 +68,17 @@ def _rel(a, b) -> float:
     return abs(float(a) - float(b)) / abs(float(b))
 
 
-@pytest.mark.parametrize("frames", ["T", "O"])
+@pytest.mark.parametrize(
+    "frames, mode",
+    [("T", "full"), ("O", "full"), ("D2", "full"), ("D2", "attention"),
+     ("T", "attention"), ("D3", "attention")],
+)  # fmt: skip
 @pytest.mark.parametrize("framed", [None, 1])
-def test_group_invariance_fixed_frames(frames, framed):
-    model = _model(frames=frames, num_framed_layers=framed)
+def test_group_invariance_fixed_frames(frames, mode, framed):
+    model = _model(frames=frames, frame_mode=mode, num_framed_layers=framed)
     pos, types = _structure()
     E0 = _energy(model, pos, CELL, types)
-    for Q in platonic_group(frames)[1:6]:
+    for Q in platonic_group(frames)[1:6]:  # (D2 has 3 non-identity elements)
         assert _rel(_energy(model, pos @ Q.T, CELL @ Q.T, types), E0) < 1e-12
     shift = torch.tensor([0.37, -0.21, 0.55], dtype=torch.float64)
     assert (
@@ -119,9 +123,54 @@ def test_so3_approximate_invariance():
         assert abs(float(E_rot.mean() - E.mean())) < 4 * sem
 
 
+def test_attention_mode_not_trivially_invariant():
+    """The group average is what makes attention mode invariant: a generic
+    rotation changes the energy (the frames do carry directional information)."""
+    model = _model(frames="D2", frame_mode="attention")
+    pos, types = _structure()
+    E0 = _energy(model, pos, CELL, types)
+    Q = haar_rotations(1, generator=torch.Generator().manual_seed(3))[0]
+    assert _rel(_energy(model, pos @ Q.T, CELL @ Q.T, types), E0) > 1e-6
+
+
+def test_attention_mode_cheaper_than_full():
+    from torch.utils.flop_counter import FlopCounterMode
+
+    pos, types = _structure()
+    flops = {}
+    for mode in ("full", "attention"):
+        model = _model(frames="T", frame_mode=mode)
+        with FlopCounterMode(display=False) as fc:
+            _energy(model, pos, CELL, types)
+        flops[mode] = fc.get_total_flops()
+    assert flops["attention"] < flops["full"] / 4
+
+
+def test_attention_mode_exported_torchscript():
+    model = _model(frames="D2", frame_mode="attention", num_framed_layers=2)
+    pos, types = _structure()
+    E0 = _energy(model, pos, CELL, types)
+    exported = model.export()
+    scripted = torch.jit.script(exported)
+    from metatomic.torch import ModelEvaluationOptions, ModelOutput
+
+    s = System(types=types, positions=pos, cell=CELL, pbc=torch.tensor([True] * 3))
+    s = get_system_with_neighbor_lists(s, exported.requested_neighbor_lists())
+    opts = ModelEvaluationOptions(
+        length_unit="angstrom", outputs={"energy": ModelOutput(sample_kind="system")}
+    )
+    E = scripted([s], opts, check_consistency=True)["energy"].block().values.sum()
+    assert _rel(E, E0) < 1e-12
+
+
 @pytest.mark.parametrize("periodic", [True, False])
-def test_forces_and_stress_finite_differences(periodic):
-    model = _model(frames="T")
+@pytest.mark.parametrize(
+    "variant",
+    [dict(frames="T"), dict(frames="D2", frame_mode="attention"),
+     dict(frames="T", frame_mode="attention", num_framed_layers=1)],
+)  # fmt: skip
+def test_forces_and_stress_finite_differences(periodic, variant):
+    model = _model(**variant)
     pos, types = _structure()
     p = pos.clone().requires_grad_()
     strain = torch.zeros(3, 3, dtype=torch.float64, requires_grad=True)

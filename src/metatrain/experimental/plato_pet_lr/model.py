@@ -29,6 +29,7 @@ from metatrain.utils.hypers import raise_if_hypers_mismatch
 from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.sum_over_atoms import sum_over_atoms
 
+from . import checkpoints
 from .documentation import ModelHypers
 from .modules.ewald import les_energy
 from .modules.frames import platonic_group, relative_rotations, sample_frames
@@ -36,7 +37,7 @@ from .modules.layers import EdgeEmbed, FrameMLP, MeshCoupling, PETLayer, cutoff_
 
 
 class PlatoPETLR(ModelInterface[ModelHypers]):
-    __checkpoint_version__ = 1
+    __checkpoint_version__ = 2
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -66,6 +67,11 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
         if self.use_mesh and not 0 <= self.couple_at < L:
             raise ValueError(f"couple_at must be in [0, {L})")
         self.use_rope = bool(h["rope"])
+        self.frame_mode = str(h["frame_mode"])
+        if self.frame_mode not in ("full", "attention"):
+            raise ValueError(f"unknown frame_mode '{self.frame_mode}'")
+        if self.frame_mode == "attention" and not self.use_rope:
+            raise ValueError("frame_mode 'attention' needs rope: true")
         self.frame_sampling = str(h["frame_sampling"])
         self.les_sigma, self.les_kcut = float(h["les_sigma"]), float(h["les_kcut"])
         nb, hid, mode = (
@@ -173,12 +179,16 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
             Rw = torch.einsum("fab,kb->fka", R, self.omega.to(r.dtype))
             ang = torch.einsum("akx,fcx->akfc", r, Rw)[:, :, :, None, :]
         manual = self.training
-        tok = self.embed(r, d, sp_center, sp_nbr, R)
+        frame_w: Optional[torch.Tensor] = None
+        if self.frame_mode == "attention":  # frames only in RoPE, one token frame
+            frame_w = w
+            rel, w = self.I_rel, self.I_w
+        tok = self.embed(r, d, sp_center, sp_nbr, R, frame_w)
         for i, layer in enumerate(self.layers):
             if i == self.n_framed:  # average over frames, then one frame, no RoPE
                 tok = (tok * w[:, None]).sum(-2, keepdim=True)
                 rel, w, ang = self.I_rel, self.I_w, None
-            tok = layer(tok, rel, w, ang, bias, rev, manual)
+            tok = layer(tok, rel, w, ang, bias, rev, manual, frame_w)
             if i == self.couple_at and self.use_mesh:
                 deltas: List[torch.Tensor] = []
                 start = 0
@@ -389,6 +399,10 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
 
     @classmethod
     def upgrade_checkpoint(cls, checkpoint: Dict) -> Dict:
+        for v in range(1, cls.__checkpoint_version__):
+            if checkpoint["model_ckpt_version"] == v:
+                getattr(checkpoints, f"model_update_v{v}_v{v + 1}")(checkpoint)
+                checkpoint["model_ckpt_version"] = v + 1
         if checkpoint["model_ckpt_version"] != cls.__checkpoint_version__:
             raise RuntimeError(
                 "Unable to upgrade the checkpoint: the checkpoint is using model "

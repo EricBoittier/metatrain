@@ -2,8 +2,10 @@
 Plato-PET-LR (Experimental)
 ===========================
 
-A PET backbone whose tokens carry ``F`` rotation frames, from a Platonic group
-(``T``, ``O``, ``I``: 12, 24, 60 frames) or a single identity frame. Every linear map
+A PET backbone whose tokens carry ``F`` rotation frames, from a point group
+(``T``, ``O``, ``I``: 12, 24, 60 frames; also ``D2``, ``C3``, ``D3``) or a single
+identity frame. A cheaper ``frame_mode: attention`` uses the frames only in the
+attention scores (see ``frame_mode``). Every linear map
 is a ``FrameLinear``, a learned continuous kernel on SO(3) over frame pairs, so the
 model is exactly invariant under the group and approximately under SO(3). Attention
 over a centre's neighbours uses rotary encodings of ``r_ij`` in each frame and a
@@ -46,8 +48,21 @@ class ModelHypers(TypedDict):
     """Number of PET layers (each one is a message-passing step)."""
     num_rbf: int = 16
     """Gaussian radial basis functions of the edge embedding."""
-    frames: Literal["identity", "T", "O", "I"] = "T"
-    """Frame group. ``identity`` is one frame: no frame machinery, not invariant."""
+    frames: Literal["identity", "C3", "D2", "D3", "T", "O", "I"] = "T"
+    """Frame group. ``identity`` is one frame: no frame machinery, not invariant.
+    ``D2`` (4 frames) is the Klein four-group of diagonal sign flips, a subgroup of
+    ``T``; ``C3`` (3) and ``D3`` (6) are cyclic and dihedral groups about [111]."""
+    frame_mode: Literal["full", "attention"] = "full"
+    """Where the frames act. ``full``: tokens carry ``F`` frames and every linear map
+    is a ``FrameLinear`` (cost ~``F n_basis`` times a plain layer). ``attention``:
+    tokens carry one frame, every linear map and MLP runs once, and the frames enter
+    only through the RoPE rotation of queries and keys (angles ``r_ij . R_f omega``);
+    the attention weights are averaged over the frames before the values. The edge
+    embedding uses ``sum_f w_f SiLU(W R_f^T r_ij)``. A group element permutes the
+    frames, so the model stays exactly group invariant; the extra cost is ``F``
+    attention-score evaluations per layer. Needs ``rope``. With one token frame
+    ``n_basis`` only reparametrises each linear map (more parameters, same FLOPs);
+    the layers after ``num_framed_layers`` run without RoPE as in ``full``."""
     num_framed_layers: Optional[int] = None
     """Layers that carry frames (all when ``None``). After them the tokens are
     averaged over the frames, and the remaining layers run with one frame and
