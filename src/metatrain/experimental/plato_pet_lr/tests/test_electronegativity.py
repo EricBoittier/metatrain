@@ -174,3 +174,19 @@ def test_old_checkpoints_convert(version):
     new = with_electronegativity(model)
     assert new.hypers["electronegativity"] == "linear"
     assert len(new.electronegativity) == 1
+
+
+def test_frozen_chi0_and_bounded_dchi():
+    """chi0_trainable: false keeps the QEq table (a buffer, no gradient);
+    dchi_bound = b keeps |dchi| < b however large the head output."""
+    m = _chi_model(chi0_trainable=False, dchi_bound=1.0)
+    chi = m.electronegativity[0]
+    assert "electronegativity.0.chi0" not in dict(m.named_parameters())
+    assert "electronegativity.0.chi0" in m.state_dict()
+    with torch.no_grad():
+        chi.head.l2.W.normal_(std=100.0)
+        chi.head.l2.b.fill_(50.0)
+    _, types = _structure()
+    h = torch.randn(len(types), 1, m.layers[0].n0.normalized_shape[0], dtype=chi.chi0.dtype)
+    dchi = chi.chi(h, torch.zeros(len(types), dtype=torch.long), m.I_rel, m.I_w) - chi.chi0[0]
+    assert dchi.abs().max() <= 1.0

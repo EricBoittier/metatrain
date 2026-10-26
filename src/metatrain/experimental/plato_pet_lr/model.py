@@ -38,7 +38,7 @@ from .modules.layers import EdgeEmbed, FrameMLP, MeshCoupling, PETLayer, cutoff_
 
 
 class PlatoPETLR(ModelInterface[ModelHypers]):
-    __checkpoint_version__ = 3
+    __checkpoint_version__ = 4
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -125,7 +125,13 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
             raise ValueError("electronegativity 'linear' needs les: true")
         # empty unless 'linear', so 'none' models keep their state dict
         self.electronegativity = torch.nn.ModuleList(
-            [Electronegativity(self.atomic_types, d, nb, hid, mode)]
+            [
+                Electronegativity(
+                    self.atomic_types, d, nb, hid, mode,
+                    chi0_trainable=bool(h["chi0_trainable"]),
+                    dchi_bound=float(h["dchi_bound"]),
+                )
+            ]
             if chi_mode == "linear"
             else []
         )

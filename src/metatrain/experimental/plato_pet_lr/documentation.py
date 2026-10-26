@@ -108,6 +108,14 @@ class ModelHypers(TypedDict):
     the energy scale of the scaler (stored as ``charge_unit`` when training
     starts), so ``KE q^2 / r`` and ``chi q`` are both in eV. ``chi0`` is fixed only
     up to a common shift (the latent charges are neutral per structure)."""
+    chi0_trainable: bool = True
+    """With ``electronegativity: linear``: learn ``chi0`` (``false``: keep the QEq
+    table fixed, a buffer, so the per-element anchor that selects the charge sign
+    cannot drift)."""
+    dchi_bound: float = 0.0
+    """With ``electronegativity: linear`` and ``> 0``: ``dchi_i = b tanh(head_i)``
+    in eV / e, so the per-atom correction cannot undo the QEq ordering of the
+    elements (H 4.528 < C 5.343 < N 6.899 < O 8.741, steps of 0.8-1.8 eV / e)."""
     les_kcut: float = 6.0
     """Reciprocal cutoff in units of ``1 / les_sigma``; a cosine window over the
     last ``1 / les_sigma`` keeps the energy smooth under strain."""

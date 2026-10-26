@@ -58,6 +58,9 @@ def initial_chi(atomic_types: List[int]) -> torch.Tensor:
 
 
 class Electronegativity(torch.nn.Module):
+    """``chi0_trainable: false`` keeps ``chi0`` at the QEq table (a buffer of the
+    same name); ``dchi_bound = b > 0`` bounds the correction, ``dchi = b tanh(head)``."""
+
     def __init__(
         self,
         atomic_types: List[int],
@@ -65,11 +68,16 @@ class Electronegativity(torch.nn.Module):
         n_basis: int,
         hidden: int,
         mode: str,
+        chi0_trainable: bool = True,
+        dchi_bound: float = 0.0,
     ):
         super().__init__()
-        self.chi0 = torch.nn.Parameter(
-            initial_chi(atomic_types).to(torch.get_default_dtype())
-        )
+        chi0 = initial_chi(atomic_types).to(torch.get_default_dtype())
+        if chi0_trainable:
+            self.chi0 = torch.nn.Parameter(chi0)
+        else:
+            self.register_buffer("chi0", chi0)
+        self.dchi_bound = float(dchi_bound)
         self.head = FrameMLP(d, 1, n_basis, hidden, mode)
         with torch.no_grad():  # dchi = 0 at the start
             self.head.l2.W.zero_()
@@ -83,6 +91,8 @@ class Electronegativity(torch.nn.Module):
     ) -> torch.Tensor:
         """Per-atom ``chi`` in eV / e."""
         dchi = (self.head(h, rel, w)[..., 0] * w).sum(-1)
+        if self.dchi_bound > 0:
+            dchi = self.dchi_bound * torch.tanh(dchi)
         return self.chi0[species] + dchi
 
     def forward(

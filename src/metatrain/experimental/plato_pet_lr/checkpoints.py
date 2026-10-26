@@ -16,3 +16,13 @@ def model_update_v2_v3(checkpoint: dict) -> None:
     :param checkpoint: The checkpoint to update in place.
     """
     checkpoint["model_data"]["model_hypers"].setdefault("electronegativity", "none")
+
+
+def model_update_v3_v4(checkpoint: dict) -> None:
+    """v4 adds ``chi0_trainable`` (true) and ``dchi_bound`` (0: unbounded).
+
+    :param checkpoint: The checkpoint to update in place.
+    """
+    hypers = checkpoint["model_data"]["model_hypers"]
+    hypers.setdefault("chi0_trainable", True)
+    hypers.setdefault("dchi_bound", 0.0)
