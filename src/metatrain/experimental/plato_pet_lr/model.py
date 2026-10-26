@@ -64,7 +64,65 @@ def _unpad(x: torch.Tensor, slot: Optional[torch.Tensor]) -> torch.Tensor:
     return flat if slot is None else flat.index_select(0, slot)
 
 
-def _rows(x: torch.Tensor, ids: List[int], S: int) -> torch.Tensor:
+Plan = Tuple[List[List[int]], List[List[int]], List[List[int]], List[torch.Tensor]]
+"""Groups of structures: ``(ids, distinct-cell ids, structure -> distinct cell,
+index tensors)``. The index tensors are empty (the lists are used) except in the
+traced training graph, where the membership varies from batch to batch."""
+
+
+def _groups(
+    keys: List[List[int]], periodic: List[bool], cells: List[List[float]], grad: bool
+) -> Tuple[Plan, List[List[int]], List[List[List[float]]]]:
+    """Periodic structures grouped by ``keys``; per group the distinct cells (each
+    structure its own with a cell gradient, the stress). Also returns the keys and
+    the distinct cells of each group."""
+    order: Dict[str, int] = {}
+    ids: List[List[int]] = []
+    uniq: List[List[int]] = []
+    umaps: List[List[int]] = []
+    gkeys: List[List[int]] = []
+    seen: List[List[List[float]]] = []
+    for s in range(len(keys)):
+        if not periodic[s]:
+            continue
+        key = str(keys[s])
+        if key not in order:
+            order[key] = len(ids)
+            ids.append(torch.jit.annotate(List[int], []))
+            uniq.append(torch.jit.annotate(List[int], []))
+            umaps.append(torch.jit.annotate(List[int], []))
+            gkeys.append(keys[s])
+            seen.append(torch.jit.annotate(List[List[float]], []))
+        g = order[key]
+        ids[g].append(s)
+        j = -1 if grad else _index_of(seen[g], cells[s])
+        if j < 0:
+            j = len(seen[g])
+            seen[g].append(cells[s])
+            uniq[g].append(s)
+        umaps[g].append(j)
+    plan: Plan = (ids, uniq, umaps, torch.jit.annotate(List[torch.Tensor], []))
+    return plan, gkeys, seen
+
+
+def _empty_plan() -> Plan:
+    return (
+        torch.jit.annotate(List[List[int]], []),
+        torch.jit.annotate(List[List[int]], []),
+        torch.jit.annotate(List[List[int]], []),
+        torch.jit.annotate(List[torch.Tensor], []),
+    )
+
+
+def _group_index(plan: Plan, g: int) -> Optional[torch.Tensor]:
+    return plan[3][g] if len(plan[3]) > 0 else None
+
+
+def _rows(
+    x: torch.Tensor, ids: List[int], S: int, index: Optional[torch.Tensor]
+) -> torch.Tensor:
+    if index is not None:
+        return x.index_select(0, index)
     if len(ids) == S:
         return x
     if ids[-1] - ids[0] + 1 == len(ids):
@@ -73,24 +131,46 @@ def _rows(x: torch.Tensor, ids: List[int], S: int) -> torch.Tensor:
 
 
 def _put_rows(
-    out: torch.Tensor, x: torch.Tensor, ids: List[int], S: int
-) -> torch.Tensor:
+    out: torch.Tensor, x: torch.Tensor, ids: List[int], S: int,
+    index: Optional[torch.Tensor],
+) -> torch.Tensor:  # fmt: skip
+    if index is not None:
+        return out.index_add(0, index, x)
     if len(ids) == S:
         return out + x
     return out.index_add(0, torch.tensor(ids, device=x.device), x)
 
 
 def _group_cells(
-    cells: torch.Tensor, ids: List[int], uniq: List[int], umap: List[int]
+    cells: torch.Tensor, plan: Plan, g: int, index: Optional[torch.Tensor]
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """The ``(U, 3, 3)`` cells of a group and the structure -> cell map (None: one
-    cell for the group, or one per structure)."""
+    """The ``(U, 3, 3)`` cells of group ``g`` and the structure -> cell map (None:
+    one cell for the group, or one per structure)."""
+    ids, uniq, umap = plan[0][g], plan[1][g], plan[2][g]
     if len(uniq) == 1:
         return cells[uniq[0] : uniq[0] + 1], None
-    cg = _rows(cells, uniq, cells.shape[0])
+    if index is not None:  # traced graph: one cell per structure
+        return cells.index_select(0, index), None
+    cg = _rows(cells, uniq, cells.shape[0], None)
     if len(uniq) == len(ids):
         return cg, None
     return cg, torch.tensor(umap, device=cells.device)
+
+
+def token_layout(
+    sp_center: torch.Tensor, sp_nbr: torch.Tensor, mask: torch.Tensor, rev: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepend the centre as slot 0 to the NEF tensors: neighbour species, mask and
+    the reversed-edge index into ``(A * (K + 1))`` (flattened)."""
+    A, K = mask.shape
+    K1 = K + 1
+    device = mask.device
+    slots = torch.arange(A * K1, device=device).reshape(A, K1)
+    rev1 = torch.div(rev, max(K, 1), rounding_mode="floor") * K1 + rev % max(K, 1) + 1
+    rev1 = torch.cat([slots[:, :1], torch.where(mask, rev1, slots[:, 1:])], 1)
+    mask1 = torch.cat([torch.ones(A, 1, dtype=torch.bool, device=device), mask], 1)
+    sp_nbr1 = torch.cat([sp_center[:, None], torch.where(mask, sp_nbr, 0)], 1)
+    return sp_nbr1, mask1, rev1.reshape(-1)
 
 
 def _clear_caches(module: torch.nn.Module, *args: Any) -> None:
@@ -217,6 +297,9 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
             hypers=get_default_hypers("scaler")["model"], dataset_info=dataset_info
         )
         self._kcache = {}  # long-range k-sets per (nmax, cell metrics, device)
+        # evaluation: Ewald sums over more than 4 x this many phase elements
+        # (atoms x k vectors) run in chunks of it (bounded memory, first derivatives)
+        self.les_chunk = 2**25
         self._register_load_state_dict_pre_hook(_clear_caches, with_module=True)
 
     @torch.jit.unused
@@ -253,15 +336,15 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
 
     def _long_range_plan(
         self, cells: torch.Tensor, systems: List[System]
-    ) -> Tuple[List[bool], List[List[int]], List[List[int]], List[torch.Tensor],
-               List[List[int]], List[List[int]]]:  # fmt: skip
+    ) -> Tuple[List[bool], Plan, List[List[int]], Plan, List[torch.Tensor]]:
         """Host-side grouping of the structures, from one device-to-host copy.
 
-        Periodic structures are grouped by mesh size and LES ``nmax`` (all the
-        bio_dimers boxes: one group); a group runs as one batched mesh coupling and
-        one batched Ewald sum. Returns per structure ``periodic``, and per group
-        the structure ids, the mesh size, the LES integer k-set on the device, and
-        the ids of the distinct cells (``[s0]``: one cell for the group)."""
+        Periodic structures are grouped by mesh size for the mesh coupling and by
+        the LES integer range ``nmax`` for the Ewald sum (bio_dimers: the 30 A box
+        gives a mesh of 30 or 31 points per axis under rotation, and one ``nmax``);
+        a group runs as one batched call. Returns ``periodic`` per structure, the
+        mesh plan and mesh sizes, the LES plan and the k-sets on the device (see
+        :func:`_groups`)."""
         S = len(systems)
         lengths = torch.linalg.norm(cells.detach(), dim=-1)  # as mesh_size/kvectors
         pbc = torch.stack([system.pbc for system in systems]).to(cells.dtype)
@@ -272,77 +355,51 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
         )
         kc = self.les_kcut / self.les_sigma
         periodic: List[bool] = []
-        keys: List[str] = []
-        order: Dict[str, int] = {}
-        groups: List[List[int]] = []
-        meshes: List[List[int]] = []
-        nmaxs: List[List[int]] = []
+        mkeys: List[List[int]] = []
+        lkeys: List[List[int]] = []
         for s in range(S):
             row = rows[s]
             n_pbc = int(row[12] + row[13] + row[14])
             if n_pbc != 0 and n_pbc != 3:
                 raise ValueError("Plato-PET-LR long range needs full or no PBC")
             periodic.append(n_pbc == 3)
-            if n_pbc != 3:
-                continue
             M: List[int] = []
             nmax: List[int] = []
             for x in row[9:12]:
                 M.append(max(8, int(math.ceil(x / self.coupling.spacing))))
                 nmax.append(int(math.floor(kc * x / (2 * math.pi))))
-            if not self.use_mesh:
-                M = [0, 0, 0]
-            if not self.use_les:
-                nmax = [0, 0, 0]
-            key = str(M) + str(nmax)
-            if key not in order:
-                order[key] = len(groups)
-                keys.append(key)
-                groups.append([s])
-                meshes.append(M)
-                nmaxs.append(nmax)
-            else:
-                groups[order[key]].append(s)
-        kvecs: List[torch.Tensor] = []
-        ucells: List[List[int]] = []
-        umaps: List[List[int]] = []
-        for g, ids in enumerate(groups):
-            # distinct cells; with a cell gradient (stress) each structure has its own
-            uniq: List[int] = []
-            seen: List[List[float]] = []
-            umap: List[int] = []
-            for s in ids:
-                c = rows[s][:9]
-                j = -1 if cells.requires_grad else _index_of(seen, c)
-                if j < 0:
-                    j = len(seen)
-                    seen.append(c)
-                    uniq.append(s)
-                umap.append(j)
-            ucells.append(uniq)
-            umaps.append(umap)
-            if not self.use_les:
-                kvecs.append(torch.zeros(0, 3, dtype=cells.dtype, device=cells.device))
-                continue
-            # metrics G = cell cell^T rounded: rotated copies share the k-set
-            mkeys: List[str] = []
-            mcells: List[List[float]] = []
-            for c in seen:
-                cell = torch.tensor(c, dtype=torch.float64).reshape(3, 3)
-                G: List[float] = (cell @ cell.T).reshape(-1).tolist()
-                scale = max([abs(x) for x in G])
-                mk = str([int(math.floor(x / scale * 1e6 + 0.5)) for x in G])
-                if mk not in mkeys:
-                    mkeys.append(mk)
-                    mcells.append(c)
-            ck = keys[g] + str(mkeys) + str(cells.device) + str(cells.dtype)
-            if ck not in self._kcache:
-                if len(self._kcache) > 64:
-                    self._kcache.clear()
-                n = kset_host(nmaxs[g], mcells, kc)
-                self._kcache[ck] = n.to(device=cells.device, dtype=cells.dtype)
-            kvecs.append(self._kcache[ck])
-        return periodic, groups, meshes, kvecs, ucells, umaps
+            mkeys.append(M)
+            lkeys.append(nmax)
+        cell_rows = [row[:9] for row in rows]
+        grad = cells.requires_grad
+        empty = _empty_plan()
+        mesh_plan, meshes = empty, torch.jit.annotate(List[List[int]], [])
+        if self.use_mesh:
+            mesh_plan, meshes, _ = _groups(mkeys, periodic, cell_rows, grad)
+        les_plan, kvecs = empty, torch.jit.annotate(List[torch.Tensor], [])
+        if self.use_les:
+            les_plan, nmaxs, seen = _groups(lkeys, periodic, cell_rows, grad)
+            for g in range(len(nmaxs)):
+                # metrics G = cell cell^T rounded: rotated copies share the k-set
+                metric_keys: List[str] = []
+                mcells: List[List[float]] = []
+                for c in seen[g]:
+                    cell = torch.tensor(c, dtype=torch.float64).reshape(3, 3)
+                    G: List[float] = (cell @ cell.T).reshape(-1).tolist()
+                    scale = max([abs(x) for x in G])
+                    mk = str([int(math.floor(x / scale * 1e6 + 0.5)) for x in G])
+                    if mk not in metric_keys:
+                        metric_keys.append(mk)
+                        mcells.append(c)
+                ck = str(nmaxs[g]) + str(metric_keys) + str(cells.device)
+                ck = ck + str(cells.dtype)
+                if ck not in self._kcache:
+                    if len(self._kcache) > 64:
+                        self._kcache.clear()
+                    n = kset_host(nmaxs[g], mcells, kc)
+                    self._kcache[ck] = n.to(device=cells.device, dtype=cells.dtype)
+                kvecs.append(self._kcache[ck])
+        return periodic, mesh_plan, meshes, les_plan, kvecs
 
     def atomic_energies(
         self,
@@ -356,17 +413,19 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
         mask: torch.Tensor,
         rev: torch.Tensor,
         system_atom: torch.Tensor,
-        groups: List[List[int]],
+        mesh_plan: Plan,
         meshes: List[List[int]],
+        les_plan: Plan,
         kvecs: List[torch.Tensor],
-        ucells: List[List[int]],
-        umaps: List[List[int]],
+        pad_to: int = 0,
     ) -> torch.Tensor:
         """Per-atom energies from the padded token layout (slot 0 = centre).
 
         ``system_atom`` ``(A, 2)``: structure and atom index. The long-range parts
         run on all structures at once in a ``(S, P)`` padded layout, per group of
-        :meth:`_long_range_plan`."""
+        :meth:`_long_range_plan`; ``P = max(sizes)``, or ``pad_to`` if it is
+        positive (then the padded layout is always used and only ``len(sizes)``
+        matters: the traced training graph of ``compile``)."""
         R, rel, w = self.frames()
         d = (r * r).sum(-1).clamp_min(1e-12).sqrt()
         fc = cutoff_fn(d, self.cutoff) * mask.to(r.dtype)
@@ -384,11 +443,11 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
             frame_w = w
             rel, w = self.I_rel, self.I_w
         S, A = len(sizes), positions.shape[0]
-        P = max(sizes)
+        P = max(sizes) if pad_to <= 0 else pad_to
         pad_slot: Optional[torch.Tensor] = None
-        if A != S * P:  # (S, P) padded layout of the atoms
+        if A != S * P or pad_to > 0:  # (S, P) padded layout of the atoms
             pad_slot = system_atom[:, 0] * P + system_atom[:, 1]
-        any_periodic = len(groups) > 0
+        any_periodic = len(mesh_plan[0]) + len(les_plan[0]) > 0
         n_periodic = 0
         for p in periodic:
             n_periodic += int(p)
@@ -409,13 +468,15 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
                 v = self.coupling.down(self.coupling.norm(x), rel, w).reshape(A, -1)
                 v_pad = _pad(v, pad_slot, S, P)
                 m_pad = torch.zeros_like(v_pad)
-                for g, ids in enumerate(groups):
-                    cg, umap = _group_cells(cells, ids, ucells[g], umaps[g])
+                for g in range(len(meshes)):
+                    gi = _group_index(mesh_plan, g)
+                    ids = mesh_plan[0][g]
+                    cg, umap = _group_cells(cells, mesh_plan, g, gi)
                     m = self.coupling.mesh_batched(
-                        _rows(v_pad, ids, S), _rows(pos_pad, ids, S),
+                        _rows(v_pad, ids, S, gi), _rows(pos_pad, ids, S, gi),
                         cg, umap, meshes[g], F,
                     )  # fmt: skip
-                    m_pad = _put_rows(m_pad, m, ids, S)
+                    m_pad = _put_rows(m_pad, m, ids, S, gi)
                 m = _unpad(m_pad, pad_slot).reshape(A, F, -1)
                 delta = self.coupling.up(m, rel, w)
                 if not all_periodic:
@@ -432,13 +493,16 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
             q_n = q_all - mean[system_atom[:, 0]]
             q_pad = _pad(q_n, pad_slot, S, P)
             e_pad = torch.zeros_like(q_pad[:, :, 0])
-            for g, ids in enumerate(groups):
-                cg, umap = _group_cells(cells, ids, ucells[g], umaps[g])
+            for g in range(len(kvecs)):
+                gi = _group_index(les_plan, g)
+                ids = les_plan[0][g]
+                cg, umap = _group_cells(cells, les_plan, g, gi)
                 eg = les_energy_periodic_batched(
-                    _rows(q_pad, ids, S), _rows(pos_pad, ids, S), cg, umap,
+                    _rows(q_pad, ids, S, gi), _rows(pos_pad, ids, S, gi), cg, umap,
                     kvecs[g], self.les_sigma, self.les_kcut,
+                    0 if self.training else self.les_chunk,
                 )  # fmt: skip
-                e_pad = _put_rows(e_pad, eg, ids, S)
+                e_pad = _put_rows(e_pad, eg, ids, S, gi)
             open_ids: List[int] = []
             for s in range(S):
                 if not periodic[s]:
@@ -446,10 +510,11 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
             if len(open_ids) > 0:
                 valid = _pad(ones[:, 0] > 0, pad_slot, S, P)
                 eg = les_energy_finite_batched(
-                    _rows(q_pad, open_ids, S), _rows(pos_pad, open_ids, S),
-                    _rows(valid, open_ids, S), self.les_sigma,
+                    _rows(q_pad, open_ids, S, None),
+                    _rows(pos_pad, open_ids, S, None),
+                    _rows(valid, open_ids, S, None), self.les_sigma,
                 )  # fmt: skip
-                e_pad = _put_rows(e_pad, eg, open_ids, S)
+                e_pad = _put_rows(e_pad, eg, open_ids, S, None)
             e = e + _unpad(e_pad, pad_slot)
             q0 = q_n[:, 0]
             for chi in self.electronegativity:
@@ -480,34 +545,24 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
             batch[4],
             batch[5],
         )
-        A, K = mask.shape
-        K1 = K + 1
-        # prepend the centre as slot 0; reversed-edge index into (A * K1)
-        slots = torch.arange(A * K1, device=device).reshape(A, K1)
-        rev1 = (
-            torch.div(rev, max(K, 1), rounding_mode="floor") * K1 + rev % max(K, 1) + 1
-        )
-        rev1 = torch.cat([slots[:, :1], torch.where(mask, rev1, slots[:, 1:])], 1)
+        sp_nbr1, mask1, rev1 = token_layout(sp_center, sp_nbr, mask, rev)
+        A = mask.shape[0]
         r = torch.cat([edge_vectors.new_zeros(A, 1, 3), edge_vectors], 1)
-        mask1 = torch.cat([torch.ones(A, 1, dtype=torch.bool, device=device), mask], 1)
-        sp_nbr1 = torch.cat([sp_center[:, None], torch.where(mask, sp_nbr, 0)], 1)
 
         sizes = [len(system) for system in systems]
         periodic: List[bool] = [False] * len(systems)
-        groups: List[List[int]] = []
+        empty = _empty_plan()
+        mesh_plan, les_plan = empty, empty
         meshes: List[List[int]] = []
         kvecs: List[torch.Tensor] = []
-        ucells: List[List[int]] = []
-        umaps: List[List[int]] = []
         if self.use_les or self.use_mesh:
-            periodic, groups, meshes, kvecs, ucells, umaps = self._long_range_plan(
+            periodic, mesh_plan, meshes, les_plan, kvecs = self._long_range_plan(
                 cells, systems
             )
 
         e = self.atomic_energies(
-            positions, cells, periodic, sizes, sp_center, sp_nbr1, r, mask1,
-            rev1.reshape(-1), samples.values.to(torch.long), groups, meshes, kvecs,
-            ucells, umaps,
+            positions, cells, periodic, sizes, sp_center, sp_nbr1, r, mask1, rev1,
+            samples.values.to(torch.long), mesh_plan, meshes, les_plan, kvecs,
         )  # fmt: skip
 
         return_dict: Dict[str, TensorMap] = {}

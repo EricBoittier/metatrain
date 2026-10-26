@@ -272,3 +272,22 @@ def test_finite_periodic_consistency():
         dipole = -KE * 2 * math.pi * 9.0 / (3 * L**3)
         assert abs(E - E_finite - dipole) < tol
         assert abs(E - E_finite) < 0.04  # was 11.49 eV
+
+
+def test_chunked_ewald_matches():
+    """Evaluation of large cells sums the Ewald series in chunks of k: the same
+    energy, forces and stress (first derivatives) as the one-shot sum."""
+    model = _model(frames="D2", frame_mode="attention")
+    pos, types = _structure()
+    pos = pos.clone().requires_grad_()
+    eps = torch.zeros(3, 3, dtype=torch.float64, requires_grad=True)
+    I3 = torch.eye(3, dtype=torch.float64)
+
+    def energy_and_grads():
+        E = _energy(model, pos @ (I3 + eps), CELL @ (I3 + eps), types)
+        return (E.detach(), *torch.autograd.grad(E, [pos, eps]))
+
+    ref = energy_and_grads()
+    model.les_chunk = 64  # far below this cell's atoms x k vectors
+    for a, b in zip(energy_and_grads(), ref, strict=True):
+        torch.testing.assert_close(a, b, rtol=1e-11, atol=1e-12)
