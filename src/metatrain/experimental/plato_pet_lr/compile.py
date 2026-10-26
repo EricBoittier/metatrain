@@ -268,7 +268,8 @@ class CompiledTrainingStep:
         key, prep = prepared
         if key not in self.graphs:
             self.graphs[key] = self._build(key, prep)
-        E, G = self.graphs[key](*prep["inputs"].values())
+        with _disable_fx_duck_shape():  # equal sizes in one batch: no recompiles
+            E, G = self.graphs[key](*prep["inputs"].values())
         self.n_compiled += 1
         S = len(systems)
         device = E.device
