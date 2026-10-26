@@ -9,6 +9,17 @@ import torch
 import torch.nn.functional as Fn
 
 
+def rows(x: torch.Tensor) -> torch.Tensor:
+    """``x`` flattened to 2-D rows, for a ``Linear`` (or an MLP of them): the force
+    graph traced by ``compile`` keeps symbolic sizes only with 2-D inputs."""
+    return x.reshape(-1, x.shape[-1])
+
+
+def unrows(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """The rows ``y`` of :func:`rows` back to the leading shape of ``x``."""
+    return y.reshape(list(x.shape[:-1]) + [y.shape[-1]])
+
+
 class FrameLinear(torch.nn.Module):
     """``y_i = sum_j sum_b k_b(R_i^T R_j) W_b x_j``, a continuous kernel on SO(3).
 
@@ -56,7 +67,7 @@ class FrameLinear(torch.nn.Module):
 
     def kernel(self, rel: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """``(F, F, n_basis)`` kernel ``k_b(R_i^T R_j) w_j``."""
-        k = self.phi(rel)
+        k = unrows(self.phi(rows(rel)), rel)
         if rel.shape[0] == 1:  # w == [1]: the product is exact, skip it
             return k
         return k * w[None, :, None]
@@ -195,15 +206,17 @@ class EdgeEmbed(torch.nn.Module):
         """``(A, K1, F, d)`` tokens, or with ``frame_w`` one group-invariant frame
         ``(A, K1, 1, d)``: the direction enters as ``sum_f w_f SiLU(W R_f^T r)``."""
         r_f = torch.einsum("fji,akj->akfi", R, r)  # r in each frame, R_f^T r
+        b = rbf(d, self.rc, self.n_rbf)
         inv = (
-            self.rad(rbf(d, self.rc, self.n_rbf))
+            unrows(self.rad(rows(b)), b)
             + self.sp_nbr(sp_nbr)
             + self.sp_center(sp_center)[:, None]
         )
+        vec = unrows(self.vec(rows(r_f)), r_f)
         if frame_w is not None:
-            v = (Fn.silu(self.vec(r_f)) * frame_w[:, None]).sum(-2, keepdim=True)
+            v = (Fn.silu(vec) * frame_w[:, None]).sum(-2, keepdim=True)
             return v + inv[:, :, None]
-        return self.vec(r_f) + inv[:, :, None]
+        return vec + inv[:, :, None]
 
 
 def attention(
@@ -386,7 +399,8 @@ class MeshCoupling(torch.nn.Module):
         k2s = k2.clamp_min(1e-12)
         V = torch.det(cell).abs()
         base = 4 * math.pi / V * torch.exp(-0.5 * self.sigma**2 * k2) / k2s * (k2 > 0)
-        g = base[..., None] * (1 + self.filt(k2s.sqrt()[..., None]))
+        ks = k2s.sqrt()[..., None]
+        g = base[..., None] * (1 + unrows(self.filt(rows(ks)), ks))
         deconv = torch.ones_like(k2)
         for a in range(3):
             deconv = (
@@ -434,7 +448,8 @@ class MeshCoupling(torch.nn.Module):
         k2s = k2.clamp_min(1e-12)
         V = torch.det(cells).abs()[:, None, None, None]
         base = 4 * math.pi / V * torch.exp(-0.5 * self.sigma**2 * k2) / k2s * (k2 > 0)
-        g = base[..., None] * (1 + self.filt(k2s.sqrt()[..., None]))
+        ks = k2s.sqrt()[..., None]
+        g = base[..., None] * (1 + unrows(self.filt(rows(ks)), ks))
         deconv = torch.ones_like(m[..., 0])
         for a in range(3):
             deconv = (
