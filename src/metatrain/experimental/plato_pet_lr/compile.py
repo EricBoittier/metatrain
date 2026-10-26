@@ -16,6 +16,7 @@ evaluated eagerly, the same way as without ``compile``.
 """
 
 import contextlib
+import itertools
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -107,17 +108,29 @@ class CompiledTrainingStep:
             return None
         if shared and (len(mesh_plan[0]) > 1 or len(les_plan[0]) > 1):
             return None
-        # canonical group order; the index tensors carry the membership
-        morder = sorted(range(len(meshes)), key=lambda g: meshes[g])
+        # Canonical mesh groups: rotations of one box give one of two sizes per
+        # axis (30 or 31 points for the 30 A bio_dimers box), so with several mesh
+        # sizes every combination lo..lo+1 of each axis gets a group, empty or not,
+        # and every batch of the dataset shares one graph.
+        by_mesh = {tuple(m): ids for m, ids in zip(meshes, mesh_plan[0], strict=True)}
+        canonical = sorted(by_mesh)
+        if len(by_mesh) > 1:
+            lo = [min(m[a] for m in by_mesh) for a in range(3)]
+            hi = [max(m[a] for m in by_mesh) for a in range(3)]
+            if all(h - b <= 1 for b, h in zip(lo, hi, strict=True)):
+                canonical = list(itertools.product(*[(b, b + 1) for b in lo]))
         lorder = sorted(range(len(kvecs)), key=lambda g: les_plan[0][g][0])
 
-        # a group of one structure gets the empty row S as a second member: a size
-        # of 1 is not symbolic in the trace (and inductor mis-compiles the mesh
-        # spread of a one-structure group); the empty row has no atoms and adds 0
+        # The empty row S pads a group of one structure (a size of 1 is not
+        # symbolic in the trace, and inductor mis-compiled the mesh spread of a
+        # one-structure group) and fills an empty group; it has no atoms and adds 0.
         def members(ids: List[int]) -> torch.Tensor:
-            return torch.tensor(ids if len(ids) > 1 else ids + [S], device=cells.device)
+            ids = ids + [S] * max(0, 2 - len(ids))
+            return torch.tensor(ids, device=cells.device)
 
-        index = {f"mesh{j}": members(mesh_plan[0][g]) for j, g in enumerate(morder)}
+        index = {
+            f"mesh{j}": members(by_mesh.get(m, [])) for j, m in enumerate(canonical)
+        }
         index.update({f"les{j}": members(les_plan[0][g]) for j, g in enumerate(lorder)})
         kv = {f"kvec{j}": kvecs[g] for j, g in enumerate(lorder)}
         sizes = [len(s) for s in systems]
@@ -125,7 +138,7 @@ class CompiledTrainingStep:
         key = (
             S,
             n_periodic == S,
-            tuple(tuple(meshes[g]) for g in morder),
+            tuple(canonical),
             len(lorder),
             shared,
             positions.dtype,
@@ -148,7 +161,7 @@ class CompiledTrainingStep:
             **index,
             **kv,
         }
-        plan = (periodic, [meshes[g] for g in morder], len(lorder), shared)
+        plan = (periodic, [list(m) for m in canonical], len(lorder), shared)
         return key, {"inputs": inputs, "plan": plan, "sizes": sizes}
 
     def _function(self, S: int, plan) -> Callable:

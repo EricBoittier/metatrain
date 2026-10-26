@@ -1,6 +1,7 @@
 """The traced training graph of ``compile`` (float64, ``eager`` backend: the trace
 and the torch.func force gradient, without the compiler)."""
 
+import pytest
 import torch
 from metatomic.torch import System
 
@@ -12,7 +13,14 @@ from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
 from .test_properties import CELL, _model, _structure
 
 
-def test_traced_step_matches_eager():
+@pytest.mark.parametrize(
+    "scales, n_meshes",
+    [
+        ([1.0, 1.01, 1.02, 1.25], 3),  # three mesh sizes, one of them alone
+        ([1.0, 1.06, 1.001, 1.061], 8),  # adjacent sizes: all 2^3 groups, 6 empty
+    ],
+)
+def test_traced_step_matches_eager(scales, n_meshes):
     """Energies, position gradients and the parameter gradient of an energy +
     force loss, on batches with several mesh sizes / k ranges (one of them a single
     structure) and one cell per structure; the second batch (other atoms) reuses
@@ -35,7 +43,7 @@ def test_traced_step_matches_eager():
 
     for seed, n_atoms in [(0, 5), (10, 3)]:
         systems = []
-        for i, scale in enumerate([1.0, 1.01, 1.02, 1.25]):
+        for i, scale in enumerate(scales):
             pos, types = _structure(seed + i)
             pos, types = pos[: n_atoms + i] * scale, types[: n_atoms + i]
             s = System(types, pos, CELL * scale, torch.tensor([True] * 3))
@@ -47,4 +55,4 @@ def test_traced_step_matches_eager():
         for a, b in zip(new[2], ref[2], strict=True):
             torch.testing.assert_close(a, b, rtol=1e-10, atol=1e-12)
     assert step.n_compiled == 2 and len(step.graphs) == 1
-    assert len(next(iter(step.graphs))[2]) > 1  # several mesh sizes
+    assert len(next(iter(step.graphs))[2]) == n_meshes
