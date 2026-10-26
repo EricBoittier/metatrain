@@ -489,7 +489,8 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
             q_all = (self.charge_head(h, rel, w) * w[:, None]).sum(-2)
             ones = torch.ones_like(q_all[:, :1])
             q_pad = _pad(torch.cat([q_all, ones], 1), pad_slot, S, P)
-            mean = q_pad[:, :, :-1].sum(1) / q_pad[:, :, -1:].sum(1)  # (S, ch)
+            count = q_pad[:, :, -1:].sum(1).clamp_min(1.0)  # empty rows: compile
+            mean = q_pad[:, :, :-1].sum(1) / count  # (S, ch)
             q_n = q_all - mean[system_atom[:, 0]]
             q_pad = _pad(q_n, pad_slot, S, P)
             e_pad = torch.zeros_like(q_pad[:, :, 0])

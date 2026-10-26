@@ -242,6 +242,14 @@ class TrainerHypers(TypedDict):
     """Random O(3) rotations/inversions of each training structure, as PET does.
     Platonic frames make the model exactly invariant only under its group."""
 
+    compile: bool = False
+    """Train with ``torch.compile``: the energy and its position gradient are traced
+    into one graph (``make_fx``, as in SPACE) and compiled, so the force loss runs
+    through compiled code. Batches the graph does not cover (mixed mesh sizes,
+    mixed periodic and open structures, stress targets) and validation run
+    eagerly. Not used with distributed training. Compiling takes a few minutes per
+    distinct batch layout (number of structures, mesh size)."""
+
     loss: str | dict[str, LossSpecification | str] = "mse"
     """This section describes the loss function to be used. See the
     :ref:`loss-functions` for more details."""

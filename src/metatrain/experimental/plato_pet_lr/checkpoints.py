@@ -26,3 +26,11 @@ def model_update_v3_v4(checkpoint: dict) -> None:
     hypers = checkpoint["model_data"]["model_hypers"]
     hypers.setdefault("chi0_trainable", True)
     hypers.setdefault("dchi_bound", 0.0)
+
+
+def trainer_update_v1_v2(checkpoint: dict) -> None:
+    """v2 adds the ``compile`` hyper; v1 trained eagerly.
+
+    :param checkpoint: The checkpoint to update in place.
+    """
+    checkpoint["train_hypers"].setdefault("compile", False)

@@ -44,6 +44,7 @@ from metatrain.utils.scaler import get_remove_scale_transform
 from metatrain.utils.transfer import batch_to
 
 from . import checkpoints
+from .compile import CompiledTrainingStep
 from .convert import set_charge_unit
 from .documentation import TrainerHypers
 from .model import PlatoPETLR
@@ -83,7 +84,7 @@ def get_scheduler(
 
 
 class Trainer(TrainerInterface[TrainerHypers]):
-    __checkpoint_version__ = 1
+    __checkpoint_version__ = 2
 
     def __init__(self, hypers: TrainerHypers) -> None:
         super().__init__(hypers)
@@ -273,6 +274,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
         if is_distributed:
             model = DistributedDataParallel(model, device_ids=[device])
 
+        compiled: Optional[CompiledTrainingStep] = None
+        if self.hypers["compile"]:
+            if is_distributed:
+                logging.warning("compile is not used with distributed training")
+            else:
+                compiled = CompiledTrainingStep(model)
+
         outputs_list = []
         for target_name, target_info in train_targets.items():
             outputs_list.append(target_name)
@@ -350,12 +358,14 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 systems, targets, extra_data = batch_to(
                     systems, targets, extra_data, dtype=dtype, device=device
                 )
-                predictions = evaluate_model(
-                    model,
-                    systems,
-                    {key: train_targets[key] for key in targets.keys()},
-                    is_training=True,
+                batch_targets = {key: train_targets[key] for key in targets.keys()}
+                predictions = (
+                    None if compiled is None else compiled(systems, batch_targets)
                 )
+                if predictions is None:
+                    predictions = evaluate_model(
+                        model, systems, batch_targets, is_training=True
+                    )
 
                 # average by the number of atoms
                 predictions = average_by_num_atoms(
