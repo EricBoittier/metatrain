@@ -15,7 +15,16 @@ class FrameLinear(torch.nn.Module):
     Two equal contractions: ``factored`` (``F (F + c_out) n_basis c_in`` per token)
     or ``folded`` into one ``(F c_out, F c_in)`` matrix (``F^2 c_in c_out``).
     ``auto`` picks the cheaper; with one frame folding is a plain linear layer.
+
+    In evaluation mode the folded matrix depends only on the parameters and the
+    (fixed) frames, so it is computed once and cached (detached: no parameter
+    gradients flow through ``phi`` / ``W`` in evaluation mode). The cache is keyed on
+    the number of frames, dtype and device, and in Python also on the parameter
+    versions (in-place updates, ``load_state_dict``); a training-mode call clears it.
     """
+
+    _cache: Optional[torch.Tensor]
+    _cache_versions: List[int]
 
     def __init__(
         self,
@@ -37,27 +46,87 @@ class FrameLinear(torch.nn.Module):
             torch.randn(n_basis, c_out, c_in) / math.sqrt(c_in * n_basis)
         )
         self.b = torch.nn.Parameter(torch.zeros(c_out)) if bias else None
+        self._cache = None
+        self._cache_versions: List[int] = []
 
     def folded(self, F: int) -> bool:
         if self.mode == "auto":
             return F * self.c_out <= self.n_basis * (F + self.c_out)
         return self.mode == "folded"
 
+    def kernel(self, rel: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """``(F, F, n_basis)`` kernel ``k_b(R_i^T R_j) w_j``."""
+        k = self.phi(rel)
+        if rel.shape[0] == 1:  # w == [1]: the product is exact, skip it
+            return k
+        return k * w[None, :, None]
+
+    def fold(self, rel: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """The folded ``(F c_out, F c_in)`` matrix."""
+        F = rel.shape[0]
+        k = self.kernel(rel, w)
+        if F == 1:
+            return (
+                k.reshape(1, self.n_basis) @ self.W.reshape(self.n_basis, -1)
+            ).reshape(self.c_out, self.c_in)
+        return torch.einsum("ijb,boc->iojc", k, self.W).reshape(
+            F * self.c_out, F * self.c_in
+        )
+
+    @torch.jit.unused
+    def _versions(self) -> List[int]:
+        return [p._version for p in self.parameters()]
+
+    def clear_cache(self) -> None:
+        self._cache = None
+        self._cache_versions = []
+
+    @torch.jit.unused
+    def _cache_allowed(self) -> bool:
+        # inference tensors cannot be reused outside inference mode
+        return not torch.is_inference_mode_enabled()
+
+    def folded_weight(self, rel: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            self._cache = None
+            return self.fold(rel, w)
+        F = rel.shape[0]
+        versions: List[int] = []
+        allowed = True
+        if not torch.jit.is_scripting():
+            allowed = self._cache_allowed()
+            versions = self._versions()
+        c = self._cache
+        if (
+            c is not None
+            and c.shape[0] == F * self.c_out
+            and c.dtype == self.W.dtype
+            and c.device == self.W.device
+            and versions == self._cache_versions
+        ):
+            return c
+        W = self.fold(rel, w)
+        if allowed:
+            W = W.detach()
+            self._cache = W
+            self._cache_versions = versions
+        return W
+
     def forward(
         self, x: torch.Tensor, rel: torch.Tensor, w: torch.Tensor
     ) -> torch.Tensor:
         F = rel.shape[0]
-        k = self.phi(rel) * w[None, :, None]
+        b = self.b
         if self.folded(F):
-            W = torch.einsum("ijb,boc->iojc", k, self.W).reshape(
-                F * self.c_out, F * self.c_in
-            )
+            W = self.folded_weight(rel, w)
             shape: List[int] = list(x.shape[:-2]) + [F, self.c_out]
+            if F == 1:
+                return Fn.linear(x.reshape(-1, self.c_in), W, b).reshape(shape)
             y = Fn.linear(x.reshape(-1, F * self.c_in), W).reshape(shape)
         else:
+            k = self.kernel(rel, w)
             z = torch.einsum("ijb,...jc->...ibc", k, x)
             y = torch.einsum("...ibc,boc->...io", z, self.W)
-        b = self.b
         return y if b is None else y + b
 
 
@@ -88,6 +157,21 @@ def apply_rope(x: torch.Tensor, ang: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, -1)
     c, s = ang.cos(), ang.sin()
     return torch.cat([x1 * c - x2 * s, x1 * s + x2 * c], -1)
+
+
+def rope_cs(ang: torch.Tensor) -> torch.Tensor:
+    """``cat([cos, cos], -1)`` and ``cat([-sin, sin], -1)`` stacked on a new leading
+    axis, computed once per forward and shared by every layer."""
+    c, s = ang.cos(), ang.sin()
+    return torch.stack([torch.cat([c, c], -1), torch.cat([-s, s], -1)])
+
+
+def apply_rope_cs(x: torch.Tensor, cs: torch.Tensor) -> torch.Tensor:
+    """:func:`apply_rope` with precomputed :func:`rope_cs`; the same floating point
+    operations (``a - b == a + (-b)``, ``+`` commutes), so bit-identical."""
+    h = x.shape[-1] // 2
+    xr = torch.cat([x[..., h:], x[..., :h]], -1)
+    return x * cs[0] + xr * cs[1]
 
 
 class EdgeEmbed(torch.nn.Module):
@@ -154,13 +238,36 @@ def frame_averaged_attention(
     return p @ v.transpose(1, 2)
 
 
+def frame_averaged_attention_qkv(
+    qkv: torch.Tensor,
+    cs: torch.Tensor,
+    frame_w: torch.Tensor,
+    bias: torch.Tensor,
+    H: int,
+) -> torch.Tensor:
+    """:func:`frame_averaged_attention` from the fused ``(A, K1, 3 d)`` projection
+    and the precomputed :func:`rope_cs` ``(2, A, K1, F, 1, Ch)``; RoPE on ``q`` and
+    ``k`` in one pass. Returns ``(A, K1, d)``."""
+    A, K1, d3 = qkv.shape
+    d = d3 // 3
+    Ch = d // H
+    qk = qkv[..., : 2 * d].reshape(A, K1, 1, 2 * H, Ch)
+    qk = apply_rope_cs(qk, cs).permute(0, 2, 3, 1, 4)  # (A, F, 2H, K1, Ch)
+    q, k = qk[:, :, :H], qk[:, :, H:]
+    a = q @ k.transpose(-1, -2) / math.sqrt(Ch) + bias[:, None]
+    p = (torch.softmax(a, -1) * frame_w[:, None, None, None]).sum(1)
+    v = qkv[..., 2 * d :].reshape(A, K1, H, Ch).transpose(1, 2)
+    return (p @ v).transpose(1, 2).reshape(A, K1, d)
+
+
 class PETLayer(torch.nn.Module):
     """Edge-reversal merge, self-attention over a centre's tokens (RoPE on r_ij,
     ``log f_c`` bias), MLP; every linear map is a ``FrameLinear``.
 
     With ``frame_w`` (attention-only frames) the tokens have one frame, every
-    linear map runs once, and the frames enter only through the RoPE angles ``ang``
-    (see :func:`frame_averaged_attention`)."""
+    linear map runs once, and the frames enter only through the RoPE angles
+    (see :func:`frame_averaged_attention`). ``cs`` is :func:`rope_cs` of the angles,
+    computed once per forward."""
 
     def __init__(self, d: int, heads: int, n_basis: int, hidden: int, mode: str):
         super().__init__()
@@ -179,7 +286,7 @@ class PETLayer(torch.nn.Module):
         tok: torch.Tensor,
         rel: torch.Tensor,
         w: torch.Tensor,
-        ang: Optional[torch.Tensor],
+        cs: Optional[torch.Tensor],
         bias: torch.Tensor,
         rev: torch.Tensor,
         manual: bool,
@@ -191,25 +298,21 @@ class PETLayer(torch.nn.Module):
         t = self.n0(tok)
         t_rev = t.reshape(A * K1, F, d).index_select(0, rev).reshape(A, K1, F, d)
         x = tok + self.merge(torch.cat([t, t_rev], -1), rel, w)
-        q, k, v = self.qkv(self.n1(x), rel, w).chunk(3, -1)
-        if frame_w is not None and ang is not None:
-            o = frame_averaged_attention(
-                q.reshape(A, K1, H, Ch),
-                k.reshape(A, K1, H, Ch),
-                v.reshape(A, K1, H, Ch),
-                ang,
-                frame_w,
-                bias,
+        qkv = self.qkv(self.n1(x), rel, w)
+        if frame_w is not None and cs is not None:
+            o = frame_averaged_attention_qkv(
+                qkv.reshape(A, K1, 3 * d), cs, frame_w, bias, H
             )
-            x = x + self.proj(o.transpose(1, 2).reshape(A, K1, 1, d), rel, w)
+            x = x + self.proj(o.reshape(A, K1, 1, d), rel, w)
             return x + self.mlp2(Fn.silu(self.mlp1(self.n2(x), rel, w)), rel, w)
-        q = q.reshape(A, K1, F, H, Ch)
-        k = k.reshape(A, K1, F, H, Ch)
-        if ang is not None:
-            q, k = apply_rope(q, ang), apply_rope(k, ang)
-        q = q.reshape(A, K1, F * H, Ch).transpose(1, 2)
-        k = k.reshape(A, K1, F * H, Ch).transpose(1, 2)
-        v = v.reshape(A, K1, F * H, Ch).transpose(1, 2)
+        if cs is not None:
+            qk = apply_rope_cs(qkv[..., : 2 * d].reshape(A, K1, F, 2 * H, Ch), cs)
+            q = qk[:, :, :, :H].reshape(A, K1, F * H, Ch).transpose(1, 2)
+            k = qk[:, :, :, H:].reshape(A, K1, F * H, Ch).transpose(1, 2)
+        else:
+            q = qkv[..., :d].reshape(A, K1, F * H, Ch).transpose(1, 2)
+            k = qkv[..., d : 2 * d].reshape(A, K1, F * H, Ch).transpose(1, 2)
+        v = qkv[..., 2 * d :].reshape(A, K1, F * H, Ch).transpose(1, 2)
         o = attention(q, k, v, bias, manual)
         x = x + self.proj(o.transpose(1, 2).reshape(A, K1, F, d), rel, w)
         return x + self.mlp2(Fn.silu(self.mlp1(self.n2(x), rel, w)), rel, w)
@@ -316,3 +419,64 @@ class MeshCoupling(torch.nn.Module):
         phi = torch.fft.irfftn(rk, s=M, dim=(1, 2, 3)).reshape(C, -1)
         m = (phi[:, idx] * wt).sum(-1).T.reshape(A, F, self.c)
         return self.up(m, rel, w)
+
+    def kfilter_batched(self, cells: torch.Tensor, mesh: List[int]) -> torch.Tensor:
+        """:meth:`kfilter` of ``U`` cells, ``(U, c_lr, M0, M1, M2 // 2 + 1)``."""
+        dt, dev = cells.dtype, cells.device
+        ms = [
+            torch.fft.fftfreq(mesh[0], 1.0 / mesh[0], dtype=dt, device=dev),
+            torch.fft.fftfreq(mesh[1], 1.0 / mesh[1], dtype=dt, device=dev),
+            torch.fft.rfftfreq(mesh[2], 1.0 / mesh[2], dtype=dt, device=dev),
+        ]
+        m = torch.stack(torch.meshgrid(ms, indexing="ij"), -1)
+        k = 2 * math.pi * m @ torch.linalg.inv(cells).transpose(-1, -2)[:, None, None]
+        k2 = (k * k).sum(-1)
+        k2s = k2.clamp_min(1e-12)
+        V = torch.det(cells).abs()[:, None, None, None]
+        base = 4 * math.pi / V * torch.exp(-0.5 * self.sigma**2 * k2) / k2s * (k2 > 0)
+        g = base[..., None] * (1 + self.filt(k2s.sqrt()[..., None]))
+        deconv = torch.ones_like(m[..., 0])
+        for a in range(3):
+            deconv = (
+                deconv
+                * ((4 + 2 * torch.cos(2 * math.pi * m[..., a] / mesh[a])) / 6) ** 2
+            )
+        return (g / deconv[..., None]).permute(0, 4, 1, 2, 3)
+
+    def mesh_batched(
+        self,
+        v: torch.Tensor,
+        pos: torch.Tensor,
+        cells: torch.Tensor,
+        umap: Optional[torch.Tensor],
+        M: List[int],
+        F: int,
+    ) -> torch.Tensor:
+        """Spread, filter and gather ``S`` structures on one mesh size ``M``.
+
+        ``v`` is ``(S, P, F c_lr)`` (zero on padded slots), ``pos`` ``(S, P, 3)``,
+        ``cells`` ``(U, 3, 3)``: one cell for all (``U = 1``), one per structure
+        (``umap`` None), or ``umap`` maps the structures to the ``U`` cells. One
+        index_add, one batched FFT pair. Returns ``(S, P, F c_lr)``."""
+        S, P, C = v.shape
+        Mt = M[0] * M[1] * M[2]
+        inv = torch.linalg.inv(cells)
+        if cells.shape[0] == 1:
+            frac = pos @ inv[0]
+        else:
+            frac = pos @ (inv if umap is None else inv[umap])
+        idx, wt = bspline4_stencil(frac.reshape(S * P, 3), M)
+        off = torch.arange(S, device=v.device) * Mt
+        gidx = (idx.reshape(S, P * 64) + off[:, None]).reshape(-1)
+        src = (v.reshape(S * P, 1, C) * wt[:, :, None]).reshape(-1, C).T
+        rho = torch.zeros(C, S * Mt, dtype=v.dtype, device=v.device).index_add(
+            1, gidx, src
+        )
+        rk = torch.fft.rfftn(rho.reshape(C, S, M[0], M[1], M[2]), dim=(2, 3, 4))
+        filt = self.kfilter_batched(cells, M)  # (U, c, ...)
+        if cells.shape[0] > 1 and umap is not None:
+            filt = filt[umap]
+        rk = rk * filt.transpose(0, 1).repeat(F, 1, 1, 1, 1)
+        phi = torch.fft.irfftn(rk, s=M, dim=(2, 3, 4)).reshape(C, -1)
+        m = (phi[:, gidx.reshape(S * P, 64)] * wt).sum(-1)
+        return m.T.reshape(S, P, C)

@@ -39,19 +39,20 @@ def _chi_model(randomise: bool = True, **kw):
 
 
 def _charges(model, pos, cell, types):
-    """Neutral latent charges (first channel) that enter the LES energy."""
+    """Neutral latent charges (first channel) that enter the LES energy (one
+    periodic structure: the padded ``(1, atoms, channels)`` layout)."""
     seen = []
-    orig = plato_model.les_energy
+    orig = plato_model.les_energy_periodic_batched
 
     def spy(q, *args):
-        seen.append(q[:, 0].detach())
+        seen.append(q[:, :, 0].detach().reshape(-1))
         return orig(q, *args)
 
-    plato_model.les_energy = spy
+    plato_model.les_energy_periodic_batched = spy
     try:
         _energy(model, pos, cell, types)
     finally:
-        plato_model.les_energy = orig
+        plato_model.les_energy_periodic_batched = orig
     return torch.cat(seen)
 
 
