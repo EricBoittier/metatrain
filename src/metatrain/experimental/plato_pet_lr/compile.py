@@ -50,16 +50,23 @@ class CompiledTrainingStep:
 
     :param model: the model, already on its training device and dtype (the traced
         graphs reference its parameters).
-    :param mode: ``torch.compile`` mode.
     :param backend: ``torch.compile`` backend (``"eager"`` checks the trace alone).
+    :param options: inductor options. The default turns off the loop reordering
+        after fusion: with it, inductor (torch 2.13, CUDA) fails on this graph with
+        ``CantSplit: s0*(64*s1 + 64) not divisible by s0*s1 + s0``.
     """
 
     def __init__(
-        self, model: PlatoPETLR, mode: Optional[str] = None, backend: str = "inductor"
+        self,
+        model: PlatoPETLR,
+        backend: str = "inductor",
+        options: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.model = model
-        self.mode = mode
         self.backend = backend
+        self.options = (
+            {"loop_ordering_after_fusion": False} if options is None else options
+        )
         self.graphs: Dict[Tuple, Callable] = {}
         self.n_eager = 0
         self.n_compiled = 0
@@ -103,6 +110,7 @@ class CompiledTrainingStep:
         # canonical group order; the index tensors carry the membership
         morder = sorted(range(len(meshes)), key=lambda g: meshes[g])
         lorder = sorted(range(len(kvecs)), key=lambda g: les_plan[0][g][0])
+
         # a group of one structure gets the empty row S as a second member: a size
         # of 1 is not symbolic in the trace (and inductor mis-compiles the mesh
         # spread of a one-structure group); the empty row has no atoms and adds 0
@@ -221,7 +229,11 @@ class CompiledTrainingStep:
                 delattr(fx, name)
         fx.recompile()
         return torch.compile(
-            fx, dynamic=True, fullgraph=True, mode=self.mode, backend=self.backend
+            fx,
+            dynamic=True,
+            fullgraph=True,
+            backend=self.backend,
+            options=self.options if self.backend == "inductor" else None,
         )
 
     def __call__(
