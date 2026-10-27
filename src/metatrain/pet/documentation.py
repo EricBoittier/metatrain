@@ -203,6 +203,14 @@ class PlatoLRHypers(TypedDict):
     total_charge_constraint: bool = False
     """Shift the latent charges to sum to the system charge (``charge`` input, needs
     ``system_conditioning``) instead of to zero."""
+    les_tail_sigma: float = 0.0
+    """LES tail: the Gaussian width (A) of the LES energy instead of ``les_sigma``
+    (periodic: reciprocal sum without self terms, k cutoff ``les_kcut /
+    les_tail_sigma``; open: erf pair sum over i != j); 0: off (``les_sigma``)."""
+    les_tail_subtract_cutoff: bool = False
+    """LES tail: subtract the within-cutoff part, ``1/2 sum over the neighbour list of
+    q_i q_j erf(r / (sqrt 2 les_tail_sigma)) / r f_c(r)`` (PET's cutoff function), so that
+    LES adds almost nothing inside the cutoff."""
     seed: int = 0
     """Seed of the RoPE directions."""
 

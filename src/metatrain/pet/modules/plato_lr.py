@@ -275,6 +275,15 @@ class PETLES(torch.nn.Module):
     with ``q`` in ``e``; ``charge_unit`` stores ``sqrt(s)`` (set by the converter).
     Charges are neutral per structure, or with ``total_charge_constraint`` they sum
     to the structure's charge: ``q_m,i <- q_m,i - (sum q_m - Q / charge_unit) / N``.
+
+    LES tail (``les_tail_sigma`` > 0): the same energy with the Gaussian width
+    ``les_tail_sigma`` instead of ``les_sigma`` (periodic: the reciprocal sum, its k
+    cutoff ``les_kcut / les_tail_sigma``, minus the self terms; open: the erf pair sum
+    over ``i != j``), so that only the long-range part of the Coulomb interaction is
+    kept. With ``les_tail_subtract_cutoff`` the part within PET's neighbour list is
+    removed too, ``1/2 sum_i q_i sum_{j in nbrs(i)} q_j erf(r_ij / (sqrt 2 sigma)) / r_ij
+    f_c(r_ij)`` with PET's cutoff function ``f_c``: LES then adds almost nothing
+    inside the cutoff.
     """
 
     def __init__(
@@ -287,6 +296,8 @@ class PETLES(torch.nn.Module):
         sigma: float,
         kcut: float,
         total_charge_constraint: bool,
+        tail_sigma: float = 0.0,
+        tail_subtract_cutoff: bool = False,
     ) -> None:
         super().__init__()
 
@@ -308,6 +319,10 @@ class PETLES(torch.nn.Module):
             }
         )
         self.sigma, self.kcut = float(sigma), float(kcut)
+        self.tail_sigma = float(tail_sigma)
+        self.tail_subtract_cutoff = bool(tail_subtract_cutoff)
+        if self.tail_subtract_cutoff and not self.tail_sigma > 0:
+            raise ValueError("les_tail_subtract_cutoff needs les_tail_sigma > 0")
         self.total_charge_constraint = total_charge_constraint
         self.les_gate = torch.nn.Parameter(torch.zeros(1))
         self.register_buffer("charge_unit", torch.ones(1))
@@ -340,12 +355,18 @@ class PETLES(torch.nn.Module):
         pbc: torch.Tensor,
         system_indices: torch.Tensor,
         total_charge: Optional[torch.Tensor],
+        edge_distances: Optional[torch.Tensor] = None,
+        neighbor_index: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Gated per-atom LES energies ``(A,)`` in model units."""
+        """Gated per-atom LES energies ``(A,)`` in model units; ``edge_distances`` and
+        ``neighbor_index`` (NEF, the neighbour atom of each slot) for the cutoff
+        subtraction of the LES tail."""
         q = self.charges(
             node_features_list, edge_features_list, padding_mask, cutoff_factors
         )
+        sigma = self.tail_sigma if self.tail_sigma > 0 else self.sigma
         e = torch.zeros_like(q[:, 0])
+        q_all = torch.zeros_like(q)
         for s in range(cells.shape[0]):
             idx = _system_atoms(system_indices, s)
             qs = q[idx]
@@ -356,12 +377,23 @@ class PETLES(torch.nn.Module):
                 Q = total_charge[s].to(qs.dtype) / self.charge_unit.to(qs.dtype)
                 shift = shift - Q / qs.shape[0]
             qs = qs - shift
+            q_all = q_all.index_copy(0, idx, qs)
             pos = positions[idx]
             if _periodic(pbc[s]):
-                es = les_energy_periodic(qs, pos, cells[s], self.sigma, self.kcut)
+                es = les_energy_periodic(qs, pos, cells[s], sigma, self.kcut)
             else:
-                es = les_energy_finite(qs, pos, self.sigma)
+                es = les_energy_finite(qs, pos, sigma)
             e = e.index_copy(0, idx, es)
+        if self.tail_subtract_cutoff:
+            if edge_distances is None or neighbor_index is None:
+                raise ValueError("les_tail_subtract_cutoff needs the edge distances")
+            # the part inside the neighbour list, smoothly by PET's cutoff function
+            d = edge_distances
+            w = torch.erf(d / (math.sqrt(2.0) * sigma)) / d * cutoff_factors
+            w = torch.where(padding_mask, w, torch.zeros_like(w))
+            qj = q_all[neighbor_index]  # (n, M, Q)
+            sub = (q_all[:, None, :] * qj * w[:, :, None]).sum((1, 2))
+            e = e - 0.5 * 14.399645 * sub  # KE
         return self.les_gate * e
 
 
@@ -417,6 +449,8 @@ def apply_plato_lr(backend: torch.nn.Module, h: dict) -> None:
             float(h.get("les_sigma", 1.0)),
             float(h.get("les_kcut", 6.0)),
             bool(h.get("total_charge_constraint", False)),
+            float(h.get("les_tail_sigma", 0.0) or 0.0),
+            bool(h.get("les_tail_subtract_cutoff", False)),
         )
     elif h.get("total_charge_constraint", False):
         raise ValueError("total_charge_constraint needs les: true")

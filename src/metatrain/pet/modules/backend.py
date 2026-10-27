@@ -524,12 +524,34 @@ class PETBackend(torch.nn.Module):
                         batch_data["pbc"],
                         system_indices,
                         batch_data.get("charge"),
+                        batch_data["edge_distances"],
+                        self._neighbor_index(batch_data, padding_mask)
+                        if self.les.tail_subtract_cutoff
+                        else None,
                     )[:, None]
                 )
 
             atomic_predictions[output_name] = block_sums
 
         return atomic_predictions, node_ll_features, edge_ll_features
+
+    def _neighbor_index(
+        self, batch_data: Dict[str, torch.Tensor], padding_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """The neighbour atom of every NEF slot (padded slots: 0), for the LES tail's
+        cutoff subtraction.
+
+        :param batch_data: The batch tensors (centers, neighbors, nef_to_edges_neighbor).
+        :param padding_mask: NEF mask of the real slots.
+        :return: ``(n_nodes, max_neighbors)`` neighbour indices.
+        """
+        out = torch.zeros(
+            padding_mask.shape, dtype=torch.long, device=padding_mask.device
+        )
+        out[batch_data["centers"], batch_data["nef_to_edges_neighbor"]] = batch_data[
+            "neighbors"
+        ].to(torch.long)
+        return out
 
     def _mesh_update(
         self, layer_index: int, node: torch.Tensor, inputs: Dict[str, torch.Tensor]

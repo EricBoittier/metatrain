@@ -327,3 +327,29 @@ def test_frame_attention_ignores_padding():
     pos2[:, -2:] = 5 * torch.randn(N, 2, 3, dtype=torch.float64)
     out2 = att(x2, cf, True, pos2)
     assert torch.allclose(out[:, :-2], out2[:, :-2], rtol=0, atol=1e-10)
+
+
+@pytest.mark.parametrize("subtract", [False, True])
+def test_les_tail(subtract):
+    """LES tail: les_tail_sigma == les_sigma without subtraction is today's LES; the
+    cutoff subtraction removes the within-cutoff part (an open dimer beyond the cutoff
+    keeps its full tail); energies and forces are finite."""
+    model = small_pet()
+    base = {"les": True, "total_charge_constraint": True}
+    ref = convert_model(model, base)
+    tail = convert_model(
+        model, {**base, "les_tail_sigma": 1.0, "les_tail_subtract_cutoff": subtract}
+    )
+    for m in (ref, tail):
+        with torch.no_grad():
+            m.backend.les.les_gate.fill_(1.0)
+        m.eval()
+    tail.load_state_dict(ref.state_dict())
+    syst = systems(model)
+    e0, f0 = energy_forces(ref, syst)
+    e1, f1 = energy_forces(tail, syst)
+    if not subtract:
+        assert torch.equal(e0, e1) and torch.equal(f0, f1)
+    else:
+        assert torch.isfinite(e1).all() and torch.isfinite(f1).all()
+        assert not torch.allclose(e0, e1)
