@@ -9,6 +9,7 @@ package)."""
 import copy
 
 import ase.build
+import ase.io
 import numpy as np
 import pytest
 import torch
@@ -81,7 +82,7 @@ def make_models(dtype):
     return models
 
 
-def random_systems(dtype):
+def random_atoms():
     """Molecules (non-periodic, varied neighbour counts, so padded edges) and
     periodic cells with rattled positions."""
     rng = np.random.default_rng(0)
@@ -92,7 +93,11 @@ def random_systems(dtype):
     atoms[-1].numbers[::3] = 8
     for a in atoms:
         a.positions += 0.15 * rng.standard_normal(a.positions.shape)
-    return systems_to_torch(atoms, dtype=dtype, device=DEVICE)
+    return atoms
+
+
+def random_systems(dtype):
+    return systems_to_torch(random_atoms(), dtype=dtype, device=DEVICE)
 
 
 def energy_forces_stress(model, systems, training: bool, create_graph: bool):
@@ -200,16 +205,18 @@ def test_unsupported_head_dim_falls_back():
 
 
 CHILD = """
-import sys, torch
-from metatomic.torch import ModelEvaluationOptions, ModelOutput, load_atomistic_model
+import sys, ase.io, torch
+from metatomic.torch import ModelEvaluationOptions, ModelOutput
+from metatomic.torch import load_atomistic_model, systems_to_torch
 from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
 model = load_atomistic_model(sys.argv[1]).to("cuda")
+atoms = ase.io.read(sys.argv[2], ":")
 systems = [
-    get_system_with_neighbor_lists(s.to("cuda"), model.requested_neighbor_lists())
-    for s in torch.load(sys.argv[2], weights_only=False)
+    get_system_with_neighbor_lists(s, model.requested_neighbor_lists())
+    for s in systems_to_torch(
+        atoms, dtype=torch.float32, device="cuda", positions_requires_grad=True
+    )
 ]
-for s in systems:
-    s.positions.requires_grad_(True)
 options = ModelEvaluationOptions(
     length_unit="Angstrom", outputs={"energy": ModelOutput(sample_kind="system")}
 )
@@ -233,11 +240,11 @@ def test_export(tmp_path):
     # the op library usually lives outside site-packages, where metatomic's
     # ``collect_extensions`` refuses to copy it: record its absolute path instead
     models["fused"].to("cpu").export().save(path)
-    torch.save([s.to("cpu") for s in systems], tmp_path / "systems.pt")
+    ase.io.write(tmp_path / "systems.xyz", random_atoms())
     env = {k: v for k, v in os.environ.items() if k != "MLIPCPP_TORCH_LIB"}
     out = str(tmp_path / "out.pt")
     subprocess.run(
-        [sys.executable, "-c", CHILD, path, str(tmp_path / "systems.pt"), out],
+        [sys.executable, "-c", CHILD, path, str(tmp_path / "systems.xyz"), out],
         check=True,
         env=env,
     )
