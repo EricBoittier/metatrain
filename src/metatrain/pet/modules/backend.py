@@ -5,6 +5,7 @@ import torch
 
 from ..documentation import ModelHypers
 from .conditioning import SystemConditioningEmbedding
+from .plato_lr import PETLES, PETMeshCoupling, apply_plato_lr
 from .structures import compute_batch_tensors
 from .transformer import CartesianTransformer
 
@@ -30,6 +31,7 @@ class PETBackend(torch.nn.Module):
     """
 
     NUM_FEATURE_TYPES: int = 2  # node + edge features
+    les_targets: List[str]  # plato_lr: targets that get the LES energy
 
     def __init__(self, hypers: ModelHypers, atomic_types: List[int]) -> None:
         super().__init__()
@@ -153,6 +155,18 @@ class PETBackend(torch.nn.Module):
             [torch.nn.Identity() for _ in range(self.num_readout_layers)]
         )
         # ===== END DIAGNOSTIC-RELATED ATTRIBUTES
+
+        # Plato-PET-LR components (``plato_lr`` hypers, see ``modules/plato_lr.py``);
+        # absent from older hypers, and all off by default
+        self.frame_rope = False
+        self.couple_at = -1
+        self.mesh: Optional[PETMeshCoupling] = None
+        self.les: Optional[PETLES] = None
+        self.les_targets: List[str] = []
+        plato_lr = hypers.get("plato_lr")
+        if plato_lr is not None:
+            apply_plato_lr(self, dict(plato_lr))
+        self.needs_long_range_inputs = self.mesh is not None or self.les is not None
 
     def add_output(self, target_name: str, output_shapes: Dict[str, List[int]]) -> None:
         """
@@ -376,6 +390,14 @@ class PETBackend(torch.nn.Module):
             featurizer_inputs["charge"] = batch_data["charge"]
             featurizer_inputs["spin_multiplicity"] = batch_data["spin_multiplicity"]
             featurizer_inputs["system_indices"] = batch_data["system_indices"]
+        if self.frame_rope:
+            ev = batch_data["edge_vectors"]
+            featurizer_inputs["token_positions"] = torch.cat(
+                [torch.zeros_like(ev[:, :1]), ev], dim=1
+            )
+        if self.mesh is not None:
+            for key in ["positions", "cells", "pbc", "system_indices"]:
+                featurizer_inputs[key] = batch_data[key]
 
         # the scaled_dot_product_attention function from torch cannot do
         # double backward, so we will use manual attention if needed
@@ -489,9 +511,46 @@ class PETBackend(torch.nn.Module):
                     num_properties,
                 )
 
+            if self.les is not None and output_name in self.les_targets:
+                block_sums[0] = (
+                    block_sums[0]
+                    + self.les(
+                        node_features_list,
+                        edge_features_list,
+                        padding_mask,
+                        cutoff_factors,
+                        batch_data["positions"],
+                        cells,
+                        batch_data["pbc"],
+                        system_indices,
+                        batch_data.get("charge"),
+                    )[:, None]
+                )
+
             atomic_predictions[output_name] = block_sums
 
         return atomic_predictions, node_ll_features, edge_ll_features
+
+    def _mesh_update(
+        self, layer_index: int, node: torch.Tensor, inputs: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Add the gated mesh coupling to the node features of GNN layer
+        ``couple_at`` (no-op without ``mesh_coupling``).
+
+        :param layer_index: Index of the GNN layer.
+        :param node: Node features after that layer.
+        :param inputs: Featurizer inputs (positions, cells, pbc, system_indices).
+        :return: The updated node features.
+        """
+        if self.mesh is None or layer_index != self.couple_at:
+            return node
+        return node + self.mesh(
+            node,
+            inputs["positions"],
+            inputs["cells"],
+            inputs["pbc"],
+            inputs["system_indices"],
+        )
 
     def _feedforward_featurization_impl(
         self, inputs: Dict[str, torch.Tensor], use_manual_attention: bool
@@ -523,19 +582,21 @@ class PETBackend(torch.nn.Module):
                 inputs["system_indices"],
             )
 
-        for (
+        for layer_index, (
             combination_norm,
             combination_mlp,
             gnn_layer,
             gnn_layer_post_mp_node,
             gnn_layer_post_mp_edge,
-        ) in zip(
-            self.combination_norms,
-            self.combination_mlps,
-            self.gnn_layers,
-            self.gnn_layers_post_mp_node,
-            self.gnn_layers_post_mp_edge,
-            strict=True,
+        ) in enumerate(
+            zip(
+                self.combination_norms,
+                self.combination_mlps,
+                self.gnn_layers,
+                self.gnn_layers_post_mp_node,
+                self.gnn_layers_post_mp_edge,
+                strict=True,
+            )
         ):
             output_node_embeddings, output_edge_embeddings = gnn_layer(
                 input_node_embeddings,
@@ -546,10 +607,14 @@ class PETBackend(torch.nn.Module):
                 inputs["edge_distances"],
                 inputs["cutoff_factors"],
                 use_manual_attention,
+                inputs.get("token_positions"),
             )
 
             if cond_embedding is not None:
                 output_node_embeddings = output_node_embeddings + cond_embedding
+            output_node_embeddings = self._mesh_update(
+                layer_index, output_node_embeddings, inputs
+            )
 
             # The GNN contraction happens by reordering the messages,
             # using a reversed neighbor list, so the new input message
@@ -612,8 +677,8 @@ class PETBackend(torch.nn.Module):
                 inputs["spin_multiplicity"],
                 inputs["system_indices"],
             )
-        for node_embedder, gnn_layer in zip(
-            self.node_embedders, self.gnn_layers, strict=True
+        for layer_index, (node_embedder, gnn_layer) in enumerate(
+            zip(self.node_embedders, self.gnn_layers, strict=True)
         ):
             input_node_embeddings = node_embedder(inputs["element_indices_nodes"])
             output_node_embeddings, output_edge_embeddings = gnn_layer(
@@ -625,9 +690,13 @@ class PETBackend(torch.nn.Module):
                 inputs["edge_distances"],
                 inputs["cutoff_factors"],
                 use_manual_attention,
+                inputs.get("token_positions"),
             )
             if cond_embedding is not None:
                 output_node_embeddings = output_node_embeddings + cond_embedding
+            output_node_embeddings = self._mesh_update(
+                layer_index, output_node_embeddings, inputs
+            )
 
             node_features_list.append(output_node_embeddings)
             edge_features_list.append(output_edge_embeddings)

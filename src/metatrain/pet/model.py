@@ -471,6 +471,12 @@ class PET(ModelInterface[ModelHypers]):
         with torch.profiler.record_function("PET::backend::compute_features"):
             # **Stage 1: Feature Computation via GNN Layers**
 
+            if self.backend.needs_long_range_inputs:
+                batch_data["positions"] = positions
+                batch_data["cells"] = cells
+                batch_data["pbc"] = torch.stack([s.pbc for s in systems])
+                batch_data["system_indices"] = system_indices
+
             if self.system_conditioning is not None:
                 charges, spin_multiplicities = _extract_charge_spin_multiplicity(
                     systems, device
@@ -1016,6 +1022,8 @@ class PET(ModelInterface[ModelHypers]):
             if hasattr(additive_model, "cutoff_radius"):
                 interaction_ranges.append(additive_model.cutoff_radius)
         interaction_range = max(interaction_ranges)
+        if self.backend.needs_long_range_inputs:  # plato_lr mesh / LES
+            interaction_range = float("inf")
 
         capabilities = ModelCapabilities(
             outputs=self.outputs,
@@ -1068,6 +1076,13 @@ class PET(ModelInterface[ModelHypers]):
 
         # The learnable heads and last layers live on the pure-PyTorch backend.
         self.backend.add_output(target_name, self.output_shapes[target_name])
+        if (
+            target_info.quantity == "energy"
+            and target_info.is_scalar
+            and len(target_info.layout.block().properties) == 1
+            and target_name not in self.backend.les_targets
+        ):
+            self.backend.les_targets.append(target_name)  # plato_lr LES energy
 
         # Register last-layer parameters, in the same order as they are returned as
         # last-layer features in the model (the modules live on ``self.backend``).
@@ -1106,6 +1121,8 @@ class PET(ModelInterface[ModelHypers]):
         self.outputs.pop(target_name, None)
         self.outputs.pop(get_last_layer_features_name(target_name), None)
         self.backend.remove_output(target_name)
+        if target_name in self.backend.les_targets:
+            self.backend.les_targets.remove(target_name)
         self.last_layer_parameter_names.pop(target_name, None)
         self.key_labels.pop(target_name, None)
         self.component_labels.pop(target_name, None)

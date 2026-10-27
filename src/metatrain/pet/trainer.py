@@ -51,6 +51,7 @@ from . import checkpoints
 from .documentation import TrainerHypers
 from .model import PET
 from .modules.finetuning import apply_finetuning_strategy
+from .modules.lr_schedule import GroupLRScheduler, GroupOptimizer
 
 
 def get_scheduler(
@@ -364,7 +365,11 @@ class Trainer(TrainerInterface[TrainerHypers]):
             for grad, ginfo in info["gradients"].items():
                 logging.info(f"\t{name}::{grad}: {ginfo}")
 
-        if self.hypers["weight_decay"] is not None:
+        lr_schedule = self.hypers.get("lr_schedule")
+        optimizer: Any
+        if lr_schedule is not None:  # per-group schedules (modules/lr_schedule.py)
+            optimizer = GroupOptimizer(model, lr_schedule)
+        elif self.hypers["weight_decay"] is not None:
             optimizer = torch.optim.AdamW(
                 model.parameters(),
                 lr=self.hypers["learning_rate"],
@@ -382,7 +387,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 optimizer.load_state_dict(self.optimizer_state_dict)
 
         # Create a learning rate scheduler
-        lr_scheduler = get_scheduler(optimizer, self.hypers, len(train_dataloader))
+        lr_scheduler: Any
+        if lr_schedule is not None:
+            lr_scheduler = GroupLRScheduler(
+                optimizer, lr_schedule, len(train_dataloader), self.hypers["num_epochs"]
+            )
+        else:
+            lr_scheduler = get_scheduler(optimizer, self.hypers, len(train_dataloader))
 
         if self.scheduler_state_dict is not None:
             # same as the optimizer, try to load the scheduler state dict
@@ -460,6 +471,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     )
 
                 train_loss_batch.backward()
+                if lr_schedule is not None:
+                    optimizer.drop_frozen_grads()  # frozen groups: no clip share
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), self.hypers["grad_clip_norm"]
                 )

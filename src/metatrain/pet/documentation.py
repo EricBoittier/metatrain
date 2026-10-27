@@ -153,6 +153,60 @@ from metatrain.utils.loss import LossSpecification
 from .modules.finetuning import FinetuneHypers, NoFinetuneHypers
 
 
+class PlatoLRHypers(TypedDict):
+    """Plato-PET-LR components inside PET (``modules/plato_lr.py``). All are off by
+    default; each enters through a zero-initialised gate (``*_gate`` parameters), so
+    a converted pretrained PET is reproduced exactly and every gate has a nonzero
+    gradient at the start. See ``metatrain.pet.modules.convert_plato_lr``."""
+
+    frames: Literal["identity", "C3", "D2", "D3", "T", "O", "I"] = "identity"
+    """Rotation frames of the attention-only frame averaging with per-frame RoPE
+    (``identity``: off). ``D2`` (4 frames) is the cheapest group with no invariant
+    vector, so the first-order RoPE term averages out."""
+    frame_mode: Literal["attention"] = "attention"
+    """Only attention-only frames (one token frame, the frames in RoPE)."""
+    rope_max_freq: float = 3.0
+    """Largest RoPE frequency (1 / A); Plato's ``linspace(0.3, rope_max_freq)``."""
+    rope_init: Literal["gate", "small"] = "gate"
+    """``gate``: Plato's frequencies and a zero-initialised per-head interpolation
+    gate ``rope_gate`` (exact at init). ``small``: no gate, frequencies times
+    ``rope_eps`` (function change ``O(rope_eps^2)``, gradients ``O(rope_eps)``)."""
+    rope_eps: float = 0.01
+    """Frequency scale for ``rope_init: small``."""
+    edge_group_sum: bool = False
+    """Add ``edge_gate * mean_f SiLU(W R_f^T r)`` to every edge embedding."""
+    mesh_coupling: bool = False
+    """Learned PME coupling on the node features after GNN layer ``couple_at``."""
+    couple_at: int = 0
+    """GNN layer after which the mesh coupling acts."""
+    mesh_channels: int = 8
+    """Latent channels on the mesh."""
+    mesh_spacing: float = 1.0
+    """Mesh spacing (A)."""
+    mesh_sigma: float = 1.5
+    """Gaussian width of the mesh kernel (A)."""
+    mesh_open_boundary: Literal["realspace", "none"] = "realspace"
+    """Non-periodic structures: the mesh kernel summed in real space (its
+    open-boundary limit), or ``none`` (no coupling)."""
+    n_basis: int = 8
+    """``FrameLinear`` basis size of Plato's mesh down / up projections."""
+    kernel_hidden: int = 32
+    """``FrameLinear`` kernel MLP width (and the mesh filter MLP width)."""
+    les: bool = False
+    """LES energy of latent charges, added to energy targets."""
+    num_charges: int = 1
+    """Latent charge channels."""
+    les_sigma: float = 1.0
+    """Gaussian width of the latent charges (A)."""
+    les_kcut: float = 6.0
+    """Reciprocal cutoff of the periodic LES sum, in units of ``1 / les_sigma``."""
+    total_charge_constraint: bool = False
+    """Shift the latent charges to sum to the system charge (``charge`` input, needs
+    ``system_conditioning``) instead of to zero."""
+    seed: int = 0
+    """Seed of the RoPE directions."""
+
+
 class ModelHypers(TypedDict):
     """Hyperparameters for the PET model."""
 
@@ -257,6 +311,9 @@ class ModelHypers(TypedDict):
     max_spin_multiplicity: int = 10
     """Maximum spin multiplicity (2S+1) for the conditioning embedding table.
     Supports values in the range ``[1, max_spin_multiplicity]``."""
+    plato_lr: PlatoLRHypers = init_with_defaults(PlatoLRHypers)
+    """Plato-PET-LR components (frame RoPE, edge group sum, mesh, LES); off by
+    default."""
 
 
 class TrainerHypers(TypedDict):
@@ -365,6 +422,13 @@ class TrainerHypers(TypedDict):
     """Metric used to select best checkpoint (e.g., ``rmse_prod``)"""
     grad_clip_norm: float = 1.0
     """Maximum gradient norm value."""
+    lr_schedule: Optional[dict] = None
+    """Per-group learning-rate schedules (``modules/lr_schedule.py``, the same spec
+    as mlip.cpp's ``--lr-schedule``): a base schedule (warmup, constant, then
+    ``cosine`` / ``linear`` / ``constant`` to ``min_lr``) times a per-group
+    ``lr_mult`` and warmup ramp, with per-group freezing, weight decay and optimizer
+    (``adam`` / ``muon``), groups matched on parameter names. Replaces
+    ``learning_rate``, ``warmup_fraction`` and ``weight_decay`` when set."""
     loss: str | dict[str, LossSpecification | str] = "mse"
     """This section describes the loss function to be used. See the
     :ref:`loss-functions` for more details."""

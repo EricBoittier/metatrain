@@ -1,5 +1,5 @@
 import warnings
-from typing import Final, Tuple
+from typing import Final, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -84,7 +84,11 @@ class AttentionBlock(nn.Module):
         self._warned_cuda_grid_dim = False
 
     def forward(
-        self, x: torch.Tensor, cutoff_factors: torch.Tensor, use_manual_attention: bool
+        self,
+        x: torch.Tensor,
+        cutoff_factors: torch.Tensor,
+        use_manual_attention: bool,
+        token_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass for the attention block.
@@ -96,6 +100,9 @@ class AttentionBlock(nn.Module):
             (which supports double backward, needed for training with conservative
             forces), or the built-in PyTorch attention (which does not support double
             backward).
+        :param token_positions: Unused here; the token positions (centre at the
+            origin, then the edge vectors) for the frame-averaged RoPE attention of
+            :class:`metatrain.pet.modules.plato_lr.FrameRoPEAttention`.
         :return: The output tensor, of shape (batch_size, seq_length, total_dim)
         """
         initial_shape = x.shape
@@ -206,6 +213,7 @@ class TransformerLayer(torch.nn.Module):
         edge_embeddings: torch.Tensor,
         cutoff_factors: torch.Tensor,
         use_manual_attention: bool,
+        token_positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.expanded_node_features:
             input_node_embeddings = self.center_contraction(node_embeddings)
@@ -213,7 +221,10 @@ class TransformerLayer(torch.nn.Module):
             input_node_embeddings = node_embeddings
         tokens = torch.cat([input_node_embeddings, edge_embeddings], dim=1)
         new_tokens = self.attention(
-            self.norm_attention(tokens), cutoff_factors, use_manual_attention
+            self.norm_attention(tokens),
+            cutoff_factors,
+            use_manual_attention,
+            token_positions,
         )
         output_node_embeddings, output_edge_embeddings = torch.split(
             new_tokens, [1, new_tokens.shape[1] - 1], dim=1
@@ -239,6 +250,7 @@ class TransformerLayer(torch.nn.Module):
         edge_embeddings: torch.Tensor,
         cutoff_factors: torch.Tensor,
         use_manual_attention: bool,
+        token_positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.expanded_node_features:
             input_node_embeddings = self.center_contraction(node_embeddings)
@@ -246,7 +258,10 @@ class TransformerLayer(torch.nn.Module):
             input_node_embeddings = node_embeddings
         tokens = torch.cat([input_node_embeddings, edge_embeddings], dim=1)
         tokens = self.norm_attention(
-            tokens + self.attention(tokens, cutoff_factors, use_manual_attention)
+            tokens
+            + self.attention(
+                tokens, cutoff_factors, use_manual_attention, token_positions
+            )
         )
         tokens = self.norm_mlp(tokens + self.mlp(tokens))
         output_node_embeddings, output_edge_embeddings = torch.split(
@@ -267,6 +282,7 @@ class TransformerLayer(torch.nn.Module):
         edge_embeddings: torch.Tensor,
         cutoff_factors: torch.Tensor,
         use_manual_attention: bool,
+        token_positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for a single Transformer layer.
@@ -281,17 +297,27 @@ class TransformerLayer(torch.nn.Module):
             (which supports double backward, needed for training with conservative
             forces), or the built-in PyTorch attention (which does not support double
             backward).
+        :param token_positions: Optional token positions for the frame-averaged
+            RoPE attention (see :class:`AttentionBlock`).
         :return: A tuple containing:
             - The output node embeddings, of shape (batch_size, d_model)
             - The output edge embeddings, of shape (batch_size, seq_length, d_model)
         """
         if self.transformer_type == "PostLN":
             node_embeddings, edge_embeddings = self._forward_post_ln_impl(
-                node_embeddings, edge_embeddings, cutoff_factors, use_manual_attention
+                node_embeddings,
+                edge_embeddings,
+                cutoff_factors,
+                use_manual_attention,
+                token_positions,
             )
         if self.transformer_type == "PreLN":
             node_embeddings, edge_embeddings = self._forward_pre_ln_impl(
-                node_embeddings, edge_embeddings, cutoff_factors, use_manual_attention
+                node_embeddings,
+                edge_embeddings,
+                cutoff_factors,
+                use_manual_attention,
+                token_positions,
             )
         return node_embeddings, edge_embeddings
 
@@ -367,6 +393,7 @@ class Transformer(torch.nn.Module):
         edge_embeddings: torch.Tensor,
         cutoff_factors: torch.Tensor,
         use_manual_attention: bool,
+        token_positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for the Transformer.
@@ -381,13 +408,19 @@ class Transformer(torch.nn.Module):
             (which supports double backward, needed for training with conservative
             forces), or the built-in PyTorch attention (which does not support double
             backward).
+        :param token_positions: Optional token positions for the frame-averaged
+            RoPE attention (see :class:`AttentionBlock`).
         :return: A tuple containing:
             - The output node embeddings, of shape (batch_size, d_model)
             - The output edge embeddings, of shape (batch_size, seq_length, d_model)
         """
         for layer in self.layers:
             node_embeddings, edge_embeddings = layer(
-                node_embeddings, edge_embeddings, cutoff_factors, use_manual_attention
+                node_embeddings,
+                edge_embeddings,
+                cutoff_factors,
+                use_manual_attention,
+                token_positions,
             )
         return node_embeddings, edge_embeddings
 
@@ -470,6 +503,7 @@ class CartesianTransformer(torch.nn.Module):
         edge_distances: torch.Tensor,
         cutoff_factors: torch.Tensor,
         use_manual_attention: bool,
+        token_positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for the CartesianTransformer.
@@ -492,6 +526,9 @@ class CartesianTransformer(torch.nn.Module):
             (which supports double backward, needed for training with conservative
             forces), or the built-in PyTorch attention (which does not support double
             backward).
+        :param token_positions: Optional ``(n_nodes, max_num_neighbors + 1, 3)``
+            token positions (centre at the origin, then the edge vectors) for the
+            frame-averaged RoPE attention; ``None`` (the default) for plain PET.
         :return: A tuple containing:
             - The output node embeddings, of shape (n_nodes, d_model)
             - The output edge embeddings, of shape (n_nodes, max_num_neighbors, d_model)
@@ -549,6 +586,9 @@ class CartesianTransformer(torch.nn.Module):
                 :, : (max_num_tokens + 1), : (max_num_tokens + 1)
             ],
             use_manual_attention=use_manual_attention,
+            token_positions=None
+            if token_positions is None
+            else token_positions[:, : (max_num_tokens + 1)],
         )
         if max_num_tokens < initial_num_tokens:
             padding = torch.zeros(
