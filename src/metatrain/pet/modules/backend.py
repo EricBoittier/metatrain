@@ -57,6 +57,7 @@ class PETBackend(torch.nn.Module):
         self.attention_temperature = hypers["attention_temperature"]
         self.transformer_type = hypers["transformer_type"]
         self.featurizer_type = hypers["featurizer_type"]
+        self.attention_backend = str(hypers.get("attention_backend", "auto"))
 
         num_atomic_species = len(atomic_types)
 
@@ -86,6 +87,7 @@ class PETBackend(torch.nn.Module):
                     self.transformer_type,
                     num_atomic_species,
                     layer_index == 0,  # is first layer
+                    attention_backend=self.attention_backend,
                 )
                 for layer_index in range(self.num_gnn_layers)
             ]
@@ -378,10 +380,16 @@ class PETBackend(torch.nn.Module):
             featurizer_inputs["system_indices"] = batch_data["system_indices"]
 
         # the scaled_dot_product_attention function from torch cannot do
-        # double backward, so we will use manual attention if needed
-        use_manual_attention = (
-            batch_data["edge_vectors"].requires_grad and self.training
-        )
+        # double backward, so we will use manual attention if needed ("auto", and
+        # "fused" where the fused op does not apply: CPU, other dtypes)
+        if self.attention_backend == "manual":
+            use_manual_attention = True
+        elif self.attention_backend == "sdpa":
+            use_manual_attention = False
+        else:
+            use_manual_attention = (
+                batch_data["edge_vectors"].requires_grad and self.training
+            )
 
         if self.featurizer_type == "feedforward":
             node_features_list, edge_features_list = (

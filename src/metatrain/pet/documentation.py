@@ -234,6 +234,19 @@ class ModelHypers(TypedDict):
     """The order in which the layer normalization and attention
     are applied in a transformer block. Available options are ``PreLN``
     (normalization before attention) and ``PostLN`` (normalization after attention)."""
+    attention_backend: Literal["auto", "sdpa", "manual", "fused"] = "auto"
+    """Implementation of the attention. ``auto`` uses PyTorch's
+    ``scaled_dot_product_attention``, except when training with gradients of the
+    positions (forces, stress), which needs a double backward and uses a manual
+    softmax attention. ``sdpa`` and ``manual`` always use one of the two (``sdpa``
+    cannot train on forces). ``fused`` uses the fused CUDA kernels of mlip.cpp
+    (``torch.ops.mlipcpp.pet_attention``, exact first and second derivatives) for
+    CUDA float32 / float64 inputs and a head dimension ``d_pet / num_heads`` in 8,
+    16, 32 or 64; elsewhere it behaves like ``auto``. The op is loaded from the
+    library in the ``MLIPCPP_TORCH_LIB`` environment variable or by the
+    ``mlipcpp_torch`` package; if neither is available, ``fused`` falls back to
+    ``auto`` with a warning. Exported models then need the library as a metatomic
+    extension. The parameters do not depend on this choice."""
     featurizer_type: Literal["residual", "feedforward"] = "feedforward"
     """Implementation of the featurizer of the model to use. Available
     options are ``residual`` (the original featurizer from the PET paper, that uses

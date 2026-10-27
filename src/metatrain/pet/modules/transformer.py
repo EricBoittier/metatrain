@@ -1,5 +1,6 @@
+import os
 import warnings
-from typing import Final, Tuple
+from typing import Final, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -11,6 +12,9 @@ from .utilities import DummyModule
 AVAILABLE_NORMALIZATIONS = ["LayerNorm", "RMSNorm"]
 AVAILABLE_TRANSFORMER_TYPES = ["PostLN", "PreLN"]
 AVAILABLE_ACTIVATIONS = ["SiLU", "SwiGLU"]
+AVAILABLE_ATTENTION_BACKENDS = ["auto", "sdpa", "manual", "fused"]
+# head dimensions (d_pet / num_heads) supported by torch.ops.mlipcpp.pet_attention
+FUSED_ATTENTION_HEAD_DIMS: List[int] = [8, 16, 32, 64]
 
 # SDPA's CUDA backward grids the attention batch (n_nodes) over gridDim.y/z, which
 # overflows above this many nodes. We work around it by looping SDPA over chunks of
@@ -50,6 +54,86 @@ class FeedForward(nn.Module):
         return x
 
 
+def fused_attention_op_available() -> bool:
+    """Whether ``torch.ops.mlipcpp.pet_attention`` (mlip.cpp's fused PET attention,
+    see :func:`load_fused_attention_op`) is registered in this process."""
+    try:
+        torch.ops.mlipcpp.pet_attention
+    except (AttributeError, RuntimeError):
+        return False
+    return True
+
+
+def load_fused_attention_op() -> bool:
+    """Register ``torch.ops.mlipcpp.pet_attention`` if it is not registered yet.
+
+    The op lives in mlip.cpp (``torch_ext/``, a CUDA extension with exact first and
+    second derivatives). It is loaded from the shared library named by the
+    ``MLIPCPP_TORCH_LIB`` environment variable, or else through the
+    ``mlipcpp_torch`` Python package (``mlipcpp_torch.load()``, which builds the
+    library on first use).
+
+    :return: whether the op is available.
+    """
+    if fused_attention_op_available():
+        return True
+    lib = os.environ.get("MLIPCPP_TORCH_LIB")
+    try:
+        if lib:
+            torch.ops.load_library(lib)
+        else:
+            import mlipcpp_torch  # noqa: PLC0415
+
+            mlipcpp_torch.load()
+    except Exception as e:  # noqa: BLE001
+        warnings.warn(
+            "attention_backend 'fused': could not load torch.ops.mlipcpp."
+            f"pet_attention ({type(e).__name__}: {e}); falling back to the "
+            "default attention",
+            stacklevel=2,
+        )
+        return False
+    return fused_attention_op_available()
+
+
+class FusedAttention(nn.Module):
+    """``torch.ops.mlipcpp.pet_attention``: fused softmax attention of the packed
+    ``qkv`` projection ``(N, L, 3 * H * d)`` (q | k | v, heads contiguous) with a
+    bias ``(N, L, L)`` shared by the heads; returns ``(N, L, H * d)``. Exact first
+    and second derivatives (force training), CUDA float32 / float64 only.
+
+    Only instantiated when the op is registered, so that TorchScript only sees the
+    op when it exists (otherwise :class:`NoFusedAttention` is used)."""
+
+    def forward(
+        self, qkv: torch.Tensor, bias: torch.Tensor, heads: int, scale: float
+    ) -> torch.Tensor:
+        """
+        :param qkv: packed projections, ``(N, L, 3 * heads * d)``
+        :param bias: additive attention bias ``(N, L, L)`` (query, key)
+        :param heads: number of heads
+        :param scale: scale of the dot products
+        :return: attention output ``(N, L, heads * d)``
+        """
+        return torch.ops.mlipcpp.pet_attention(qkv, bias, heads, scale)[0]
+
+
+class NoFusedAttention(nn.Module):
+    """Placeholder for :class:`FusedAttention` when the op is not available."""
+
+    def forward(
+        self, qkv: torch.Tensor, bias: torch.Tensor, heads: int, scale: float
+    ) -> torch.Tensor:
+        """
+        :param qkv: unused
+        :param bias: unused
+        :param heads: unused
+        :param scale: unused
+        :return: never returns
+        """
+        raise RuntimeError("torch.ops.mlipcpp.pet_attention is not available")
+
+
 class AttentionBlock(nn.Module):
     """
     Multi-head attention block.
@@ -60,6 +144,10 @@ class AttentionBlock(nn.Module):
            This is combined with the standard scaling by the square root of
            the head dimension.
     :param epsilon: A small value to avoid division by zero.
+    :param attention_backend: ``"fused"`` uses ``torch.ops.mlipcpp.pet_attention``
+        (see :func:`load_fused_attention_op`) for CUDA float32 / float64 inputs, if
+        the op can be loaded and the head dimension is supported; any other value
+        keeps the SDPA / manual attention selected by ``use_manual_attention``.
     """
 
     def __init__(
@@ -68,6 +156,7 @@ class AttentionBlock(nn.Module):
         num_heads: int,
         temperature: float,
         epsilon: float = 1e-15,
+        attention_backend: str = "auto",
     ) -> None:
         super(AttentionBlock, self).__init__()
 
@@ -82,6 +171,20 @@ class AttentionBlock(nn.Module):
         self.head_dim = total_dim // num_heads
         self.max_cuda_grid_dim = MAX_CUDA_GRID_DIM
         self._warned_cuda_grid_dim = False
+
+        self.use_fused_attention = False
+        self.fused_attention: nn.Module = NoFusedAttention()
+        if attention_backend == "fused":
+            if self.head_dim not in FUSED_ATTENTION_HEAD_DIMS:
+                warnings.warn(
+                    f"attention_backend 'fused' needs a head dimension in "
+                    f"{FUSED_ATTENTION_HEAD_DIMS}, got {self.head_dim} "
+                    "(d_pet / num_heads); falling back to the default attention",
+                    stacklevel=2,
+                )
+            elif load_fused_attention_op():
+                self.use_fused_attention = True
+                self.fused_attention = FusedAttention()
 
     def forward(
         self, x: torch.Tensor, cutoff_factors: torch.Tensor, use_manual_attention: bool
@@ -100,6 +203,17 @@ class AttentionBlock(nn.Module):
         """
         initial_shape = x.shape
         x = self.input_linear(x)
+        scale = 1.0 / (self.head_dim**0.5 * self.temperature)
+        if (
+            self.use_fused_attention
+            and x.is_cuda
+            and (x.dtype == torch.float32 or x.dtype == torch.float64)
+        ):
+            # same bias as below, (N, L, L) shared by the heads; the packed
+            # (N, L, 3, H, d) projection is the op's qkv layout
+            bias = torch.log(torch.clamp(cutoff_factors, self.epsilon))
+            x = self.fused_attention(x, bias, self.num_heads, scale)
+            return self.output_linear(x)
         x = x.reshape(
             initial_shape[0], initial_shape[1], 3, self.num_heads, self.head_dim
         )
@@ -108,7 +222,6 @@ class AttentionBlock(nn.Module):
         queries, keys, values = x[0], x[1], x[2]
         attn_weights = torch.clamp(cutoff_factors[:, None, :, :], self.epsilon)
         attn_weights = torch.log(attn_weights)
-        scale = 1.0 / (self.head_dim**0.5 * self.temperature)
         if use_manual_attention:
             x = manual_attention(queries, keys, values, attn_weights, self.temperature)
         elif x.requires_grad and initial_shape[0] > self.max_cuda_grid_dim:
@@ -164,6 +277,7 @@ class TransformerLayer(torch.nn.Module):
     :param activation: The activation function, either "SiLU" or "SwiGLU".
     :param transformer_type: The type of transformer, either "PostLN" or "PreLN".
     :param temperature: An additional scaling factor for attention scores.
+    :param attention_backend: See :class:`AttentionBlock`.
     """
 
     def __init__(
@@ -176,9 +290,12 @@ class TransformerLayer(torch.nn.Module):
         activation: str = "SiLU",
         transformer_type: str = "PostLN",
         temperature: float = 1.0,
+        attention_backend: str = "auto",
     ) -> None:
         super(TransformerLayer, self).__init__()
-        self.attention = AttentionBlock(d_model, n_heads, temperature)
+        self.attention = AttentionBlock(
+            d_model, n_heads, temperature, attention_backend=attention_backend
+        )
         self.transformer_type = transformer_type
         self.d_model = d_model
         norm_class = getattr(nn, norm)
@@ -311,6 +428,8 @@ class Transformer(torch.nn.Module):
     :param attention_temperature: The temperature scaling factor for attention
         scores. This is combined with the standard scaling by the square root of
         the head dimension.
+    :param attention_backend: The attention implementation, one of
+        ``AVAILABLE_ATTENTION_BACKENDS`` (see :class:`AttentionBlock`).
     """
 
     def __init__(
@@ -324,8 +443,14 @@ class Transformer(torch.nn.Module):
         activation: str = "SiLU",
         transformer_type: str = "PostLN",
         attention_temperature: float = 1.0,
+        attention_backend: str = "auto",
     ) -> None:
         super(Transformer, self).__init__()
+        if attention_backend not in AVAILABLE_ATTENTION_BACKENDS:
+            raise ValueError(
+                f"Unknown attention backend: {attention_backend}. "
+                f"Please choose from: {AVAILABLE_ATTENTION_BACKENDS}"
+            )
         if norm not in AVAILABLE_NORMALIZATIONS:
             raise ValueError(
                 f"Unknown normalization flag: {norm}. "
@@ -356,6 +481,7 @@ class Transformer(torch.nn.Module):
                     activation=activation,
                     transformer_type=transformer_type,
                     temperature=attention_temperature,
+                    attention_backend=attention_backend,
                 )
                 for _ in range(num_layers)
             ]
@@ -409,6 +535,8 @@ class CartesianTransformer(torch.nn.Module):
     :param transformer_type: The type of transformer, either "PostLN" or "PreLN".
     :param n_atomic_species: The number of atomic species.
     :param is_first: Whether this is the first transformer in the model.
+    :param attention_backend: The attention implementation (see
+        :class:`AttentionBlock`).
     """
 
     def __init__(
@@ -426,6 +554,7 @@ class CartesianTransformer(torch.nn.Module):
         transformer_type: str,
         n_atomic_species: int,
         is_first: bool,
+        attention_backend: str = "auto",
     ) -> None:
         super(CartesianTransformer, self).__init__()
         self.is_first = is_first
@@ -441,6 +570,7 @@ class CartesianTransformer(torch.nn.Module):
             activation=activation,
             transformer_type=transformer_type,
             attention_temperature=attention_temperature,
+            attention_backend=attention_backend,
         )
 
         self.edge_embedder = nn.Linear(4, d_model)

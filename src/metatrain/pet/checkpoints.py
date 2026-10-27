@@ -374,6 +374,16 @@ def model_update_v15_v16(checkpoint: dict) -> None:
             checkpoint[key] = updated
 
 
+def model_update_v16_v17(checkpoint: dict) -> None:
+    """
+    Update a v16 checkpoint to v17: adds the ``attention_backend`` hyperparameter
+    (``"auto"``, the attention used before it existed).
+
+    :param checkpoint: The checkpoint to update.
+    """
+    checkpoint["model_data"]["model_hypers"].setdefault("attention_backend", "auto")
+
+
 ###########################
 # TRAINER #################
 ###########################
