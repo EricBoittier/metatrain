@@ -36,6 +36,16 @@ def model_update_v4_v5(checkpoint: dict) -> None:
     checkpoint["model_data"]["model_hypers"].setdefault("attention_backend", "auto")
 
 
+def model_update_v5_v6(checkpoint: dict) -> None:
+    """v6 adds ``mesh_normalization``; every model up to v5 has the mesh potential
+    divided by the number of mesh points, ``per_point``.
+
+    :param checkpoint: The checkpoint to update in place.
+    """
+    hypers = checkpoint["model_data"]["model_hypers"]
+    hypers.setdefault("mesh_normalization", "per_point")
+
+
 def trainer_update_v1_v2(checkpoint: dict) -> None:
     """v2 adds the ``compile`` hyper; v1 trained eagerly.
 

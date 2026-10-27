@@ -13,6 +13,7 @@ from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
 from .test_properties import CELL, _model, _structure
 
 
+@pytest.mark.parametrize("normalization", ["physical", "per_point"])
 @pytest.mark.parametrize(
     "scales, n_meshes",
     [
@@ -20,12 +21,14 @@ from .test_properties import CELL, _model, _structure
         ([1.0, 1.06, 1.001, 1.061], 8),  # adjacent sizes: all 2^3 groups, 6 empty
     ],
 )
-def test_traced_step_matches_eager(scales, n_meshes):
+def test_traced_step_matches_eager(scales, n_meshes, normalization):
     """Energies, position gradients and the parameter gradient of an energy +
     force loss, on batches with several mesh sizes / k ranges (one of them a single
     structure) and one cell per structure; the second batch (other atoms) reuses
     the graph of the first, so its sizes must have stayed symbolic."""
-    model = _model(frames="D2", frame_mode="attention").train()
+    model = _model(
+        frames="D2", frame_mode="attention", mesh_normalization=normalization
+    ).train()
     info = {
         "energy": get_energy_target_info(
             "energy", {"unit": "eV"}, add_position_gradients=True

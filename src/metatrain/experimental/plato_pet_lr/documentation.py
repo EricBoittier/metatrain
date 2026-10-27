@@ -90,6 +90,20 @@ class ModelHypers(TypedDict):
     """Mesh spacing; the mesh has ``ceil(|a_i| / spacing)`` points per cell vector."""
     mesh_sigma: float = 1.5
     """Gaussian width of the mesh filter."""
+    mesh_normalization: Literal["physical", "per_point"] = "physical"
+    """Normalisation of the mesh potential. The filter is ``4 pi / V exp(-sigma^2
+    k^2 / 2) / k^2 (1 + f(|k|))`` (over the B-spline deconvolution). ``physical``:
+    the potential on the mesh is the Ewald reciprocal-space potential of the
+    Gaussian-smeared channel charges, independent of the mesh size, so the coupling
+    has the same strength in every cell and a cluster in a large box sees the open
+    boundary limit. ``per_point``: that potential divided by the number of mesh
+    points ``M = M0 M1 M2`` (the inverse FFT's ``1 / M`` on top of the ``4 pi / V``
+    already in the filter), so for a fixed ``mesh_spacing`` the coupling falls as
+    ``~1 / V``, and a cell length crossing a multiple of the spacing changes ``M``
+    and the coupling by a step (30 -> 31 points per axis: 10 %). All models trained
+    up to 27 Oct 2026 (checkpoint v5 and older, and mlip.cpp GGUFs without
+    ``plato.mesh_normalization``) use ``per_point``; old checkpoints are upgraded
+    to it and give identical numbers. New models default to ``physical``."""
     les: bool = True
     """Energy of learned latent charges (LES)."""
     num_charges: int = 1

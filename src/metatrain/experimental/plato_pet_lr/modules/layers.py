@@ -462,7 +462,13 @@ def bspline4_stencil(frac: torch.Tensor, mesh: List[int]):
 
 class MeshCoupling(torch.nn.Module):
     """Learned PME: spread ``c_lr`` channels per frame on a mesh (B-spline order 4),
-    filter by ``4 pi/V exp(-sigma^2 k^2/2)/k^2 (1 + f(|k|))``, interpolate back."""
+    filter by ``4 pi/V exp(-sigma^2 k^2/2)/k^2 (1 + f(|k|))``, interpolate back.
+
+    ``normalization``: ``physical``, the mesh potential is the Ewald reciprocal
+    potential of the Gaussian-smeared mesh charges (the filter is multiplied by the
+    number of mesh points ``M``, which undoes the ``1 / M`` of ``irfftn``);
+    ``per_point``, that potential divided by ``M`` (the coupling of the models
+    trained up to 27 Oct 2026, checkpoint v5 and older)."""
 
     def __init__(
         self,
@@ -473,9 +479,13 @@ class MeshCoupling(torch.nn.Module):
         hidden: int,
         mode: str,
         sigma: float = 1.5,
+        normalization: str = "per_point",
     ):
         super().__init__()
+        if normalization not in ("physical", "per_point"):
+            raise ValueError(f"unknown mesh_normalization '{normalization}'")
         self.c, self.spacing, self.sigma = c_lr, spacing, sigma
+        self.physical = normalization == "physical"
         self.norm = torch.nn.LayerNorm(d)
         self.down = FrameLinear(d, c_lr, n_basis, hidden, mode=mode)
         self.up = FrameLinear(c_lr, d, n_basis, hidden, mode=mode)
@@ -502,6 +512,8 @@ class MeshCoupling(torch.nn.Module):
         k2 = (k * k).sum(-1)
         k2s = k2.clamp_min(1e-12)
         V = torch.det(cell).abs()
+        if self.physical:  # undo the 1 / M of irfftn
+            V = V / float(mesh[0] * mesh[1] * mesh[2])
         base = 4 * math.pi / V * torch.exp(-0.5 * self.sigma**2 * k2) / k2s * (k2 > 0)
         ks = k2s.sqrt()[..., None]
         g = base[..., None] * (1 + unrows(self.filt(rows(ks)), ks))
@@ -551,6 +563,8 @@ class MeshCoupling(torch.nn.Module):
         k2 = (k * k).sum(-1)
         k2s = k2.clamp_min(1e-12)
         V = torch.det(cells).abs()[:, None, None, None]
+        if self.physical:  # undo the 1 / M of irfftn
+            V = V / float(mesh[0] * mesh[1] * mesh[2])
         base = 4 * math.pi / V * torch.exp(-0.5 * self.sigma**2 * k2) / k2s * (k2 > 0)
         ks = k2s.sqrt()[..., None]
         g = base[..., None] * (1 + unrows(self.filt(rows(ks)), ks))

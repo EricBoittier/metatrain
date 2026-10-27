@@ -50,6 +50,19 @@ symbolic-shape aware and its backward op has no autograd kernel of its own.
 Checkpoint v5 adds the hyper (v4 upgrades to `auto`); the state dict does not depend
 on it, and `set_attention_backend` switches a loaded model.
 
+`mesh_normalization` (`MeshCoupling.kfilter`, `kfilter_batched`): the filter
+`4 pi / V exp(-sigma^2 k^2 / 2) / k^2 (1 + f) / deconv` already carries the Ewald
+prefactor, and `irfftn` (norm "backward") divides by `M = M0 M1 M2` once more, so
+up to checkpoint v5 the mesh potential was the Ewald reciprocal potential over `M`
+(`per_point`): with a fixed spacing `M ~ V / h^3`, the coupling fell as `~1 / V`
+and stepped by 10 % when a 30 A cell length read as just above 30 (31 points).
+`physical` divides `V` by `M` in the filter (one place, both paths: eager, the
+traced graph of `compile` and export all go through `kfilter_batched`), so the
+mesh potential is the Ewald one of the Gaussian channel charges. Checkpoint v6
+adds the hyper, v5 and older upgrade to `per_point` (bit-identical:
+`tests/checkpoints/model-v5_per_point_outputs.json`, `test_mesh_normalization.py`).
+mlip.cpp: GGUF key `plato.mesh_normalization` (missing: `per_point`).
+
 `electronegativity: linear` ([`modules/electronegativity.py`](modules/electronegativity.py)):
 `E_chi = sum_i chi_i q_i` on the first latent channel, `chi_i = chi0[Z_i] + dchi_i`.
 The LES energy `1/2 q^T K q` is even in `q`, so without this term the charge sign is

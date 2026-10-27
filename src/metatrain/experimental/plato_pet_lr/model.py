@@ -189,7 +189,7 @@ def _index_of(rows: List[List[float]], row: List[float]) -> int:
 
 
 class PlatoPETLR(ModelInterface[ModelHypers]):
-    __checkpoint_version__ = 5
+    __checkpoint_version__ = 6
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -267,6 +267,7 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
         self.coupling = MeshCoupling(
             d, int(h["mesh_channels"]), float(h["mesh_spacing"]), nb, hid, mode,
             sigma=float(h["mesh_sigma"]),
+            normalization=str(h["mesh_normalization"]),
         )  # fmt: skip
         self.energy_head = FrameMLP(d, 1, nb, hid, mode)
         self.charge_head = FrameMLP(d, int(h["num_charges"]), nb, hid, mode)
