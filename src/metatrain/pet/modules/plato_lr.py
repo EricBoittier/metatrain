@@ -105,8 +105,17 @@ class FrameRoPEAttention(AttentionBlock):
             o_ref = o
             if not use_manual_attention:
                 o_ref = manual_attention(q, k, v, bias, self.temperature)
+            # the padded keys (cutoff factor 0) masked exactly: PET's finite
+            # log(epsilon) bias is negligible for its own attention, but the per-frame
+            # rotations can lift a padded key's score, so the frame path would depend on
+            # what fills the padded slots (and on how structures are batched)
+            exact = torch.where(
+                cutoff_factors[:, None, :, :] > 0,
+                bias,
+                torch.full_like(bias, float("-inf")),
+            )
             o = o + self.rope_gate[None, :, None, None] * (
-                self.frame_attention(q, k, v, bias, token_positions) - o_ref
+                self.frame_attention(q, k, v, exact, token_positions) - o_ref
             )
         return self.output_linear(o.transpose(1, 2).reshape(N, L, D))
 

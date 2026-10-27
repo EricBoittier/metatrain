@@ -293,3 +293,37 @@ def test_checkpoint_round_trip_and_export(tmp_path):
     out = loaded(syst, opts, check_consistency=True)
     e2 = out["energy"].block().values.sum(-1)
     assert torch.allclose(e0.detach(), e2.detach(), rtol=0, atol=1e-12)
+
+
+
+def test_frame_attention_ignores_padding():
+    """The frame path masks padded neighbour slots (cutoff factor 0) exactly: with the
+    gate at 1 the attention output of the real tokens does not depend on the padded
+    tokens' contents (PET's finite log(1e-15) bias lets large rotated scores through)."""
+    from metatrain.experimental.plato_pet_lr.modules.frames import platonic_group
+    from metatrain.pet.modules.plato_lr import FrameRoPEAttention, rope_omega_init
+    from metatrain.pet.modules.transformer import AttentionBlock
+
+    torch.manual_seed(0)
+    N, L, D, H = 3, 6, 16, 2
+    block = AttentionBlock(D, H, 1.0).to(torch.float64)
+    att = FrameRoPEAttention(
+        block,
+        platonic_group("D2"),
+        rope_omega_init(D // H, 3.0, 0),
+        gated=True,
+    ).to(torch.float64)
+    with torch.no_grad():
+        att.rope_gate.fill_(1.0)
+    cf = torch.ones(N, L, dtype=torch.float64)
+    cf[:, -2:] = 0.0  # two padded slots per sequence
+    cf = cf[:, None, :].repeat(1, L, 1)
+    x = torch.randn(N, L, D, dtype=torch.float64)
+    pos = torch.randn(N, L, 3, dtype=torch.float64) * 2
+    pos[:, 0] = 0.0
+    out = att(x, cf, True, pos)
+    x2, pos2 = x.clone(), pos.clone()
+    x2[:, -2:] = 50 * torch.randn(N, 2, D, dtype=torch.float64)
+    pos2[:, -2:] = 5 * torch.randn(N, 2, 3, dtype=torch.float64)
+    out2 = att(x2, cf, True, pos2)
+    assert torch.allclose(out[:, :-2], out2[:, :-2], rtol=0, atol=1e-10)
