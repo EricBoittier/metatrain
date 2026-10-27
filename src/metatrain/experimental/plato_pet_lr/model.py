@@ -236,7 +236,7 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
         if self.les_pme_order % 2 != 0 or not 4 <= self.les_pme_order <= 12:
             raise ValueError("les_pme_order must be even, 4 to 12")
         self.les_pme_spacing = float(hd.get("les_pme_spacing", 0.5))
-        self.les_pme_atoms = int(hd.get("les_pme_atoms", 512))
+        self.les_pme_atoms = int(hd.get("les_pme_atoms", 128))
         nb, hid, mode = (
             int(h["n_basis"]),
             int(h["kernel_hidden"]),

@@ -130,8 +130,11 @@ class ModelHypers(TypedDict):
     les_pme_spacing: float = 0.5
     """PME mesh spacing in units of ``les_sigma``; below ``pi / les_kcut`` (0.52)
     the mesh holds every k vector of the direct sum."""
-    les_pme_atoms: int = 512
-    """``les_method: auto``: PME from this many atoms per structure."""
+    les_pme_atoms: int = 128
+    """``les_method: auto``: PME from this many atoms per structure. Measured
+    crossover (D2-attention model, 30 A dimer cell tiled): GH200 PME is faster from
+    20 atoms, one CPU (24 threads) from between 20 and 160 atoms; the bio_dimers
+    training structures (< 128 atoms) keep the direct sum."""
     seed: int = 0
     """Seed of the RoPE directions."""
 
