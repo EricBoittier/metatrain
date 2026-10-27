@@ -1,5 +1,9 @@
 import warnings
-from typing import Final, Optional, Tuple
+from typing import Final, Tuple
+
+
+# isort: split
+from typing import Optional  # own line: merges with other branches
 
 import torch
 import torch.nn.functional as F
