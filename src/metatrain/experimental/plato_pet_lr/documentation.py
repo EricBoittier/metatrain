@@ -119,6 +119,19 @@ class ModelHypers(TypedDict):
     les_kcut: float = 6.0
     """Reciprocal cutoff in units of ``1 / les_sigma``; a cosine window over the
     last ``1 / les_sigma`` keeps the energy smooth under strain."""
+    les_method: Literal["ewald", "pme", "auto"] = "auto"
+    """Periodic LES sum: ``ewald`` the direct k-sum (``O(atoms x k vectors)``, about
+    ``O(N^2)`` at a fixed density), ``pme`` smooth particle-mesh Ewald of the same
+    windowed sum (``O(N log N)``, interpolation error ~1e-5 relative in the forces
+    at the defaults), ``auto`` PME for structures of at least ``les_pme_atoms``
+    atoms (a per-structure atom count, so a trajectory never switches)."""
+    les_pme_order: int = 8
+    """B-spline order of the PME charge assignment (even, 4 to 12)."""
+    les_pme_spacing: float = 0.5
+    """PME mesh spacing in units of ``les_sigma``; below ``pi / les_kcut`` (0.52)
+    the mesh holds every k vector of the direct sum."""
+    les_pme_atoms: int = 512
+    """``les_method: auto``: PME from this many atoms per structure."""
     seed: int = 0
     """Seed of the RoPE directions."""
 

@@ -37,6 +37,8 @@ from .modules.ewald import (
     kset_host,
     les_energy_finite_batched,
     les_energy_periodic_batched,
+    les_energy_pme_batched,
+    pme_mesh,
 )
 from .modules.frames import platonic_group, relative_rotations, sample_frames
 from .modules.layers import (
@@ -225,6 +227,16 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
             raise ValueError("frame_mode 'attention' needs rope: true")
         self.frame_sampling = str(h["frame_sampling"])
         self.les_sigma, self.les_kcut = float(h["les_sigma"]), float(h["les_kcut"])
+        # periodic LES sum: direct Ewald or PME (older checkpoints: the defaults)
+        hd = dict(h)
+        self.les_method = str(hd.get("les_method", "auto"))
+        if self.les_method not in ("ewald", "pme", "auto"):
+            raise ValueError(f"unknown les_method '{self.les_method}'")
+        self.les_pme_order = int(hd.get("les_pme_order", 8))
+        if self.les_pme_order % 2 != 0 or not 4 <= self.les_pme_order <= 12:
+            raise ValueError("les_pme_order must be even, 4 to 12")
+        self.les_pme_spacing = float(hd.get("les_pme_spacing", 0.5))
+        self.les_pme_atoms = int(hd.get("les_pme_atoms", 512))
         nb, hid, mode = (
             int(h["n_basis"]),
             int(h["kernel_hidden"]),
@@ -277,7 +289,11 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
         self.electronegativity = torch.nn.ModuleList(
             [
                 Electronegativity(
-                    self.atomic_types, d, nb, hid, mode,
+                    self.atomic_types,
+                    d,
+                    nb,
+                    hid,
+                    mode,
                     chi0_trainable=bool(h["chi0_trainable"]),
                     dchi_bound=float(h["dchi_bound"]),
                 )
@@ -336,15 +352,19 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
 
     def _long_range_plan(
         self, cells: torch.Tensor, systems: List[System]
-    ) -> Tuple[List[bool], Plan, List[List[int]], Plan, List[torch.Tensor]]:
+    ) -> Tuple[
+        List[bool], Plan, List[List[int]], Plan, List[torch.Tensor], List[List[int]]
+    ]:
         """Host-side grouping of the structures, from one device-to-host copy.
 
         Periodic structures are grouped by mesh size for the mesh coupling and by
         the LES integer range ``nmax`` for the Ewald sum (bio_dimers: the 30 A box
         gives a mesh of 30 or 31 points per axis under rotation, and one ``nmax``);
         a group runs as one batched call. Returns ``periodic`` per structure, the
-        mesh plan and mesh sizes, the LES plan and the k-sets on the device (see
-        :func:`_groups`)."""
+        mesh plan and mesh sizes, the LES plan, the k-sets on the device and the LES
+        PME meshes (see :func:`_groups`): a structure on PME (``les_method``) is in
+        an LES group keyed by its PME mesh, with an empty k-set and the mesh size;
+        the direct groups have ``[]``."""
         S = len(systems)
         lengths = torch.linalg.norm(cells.detach(), dim=-1)  # as mesh_size/kvectors
         pbc = torch.stack([system.pbc for system in systems]).to(cells.dtype)
@@ -369,7 +389,19 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
                 M.append(max(8, int(math.ceil(x / self.coupling.spacing))))
                 nmax.append(int(math.floor(kc * x / (2 * math.pi))))
             mkeys.append(M)
-            lkeys.append(nmax)
+            pme = self.les_method == "pme" or (
+                self.les_method == "auto" and len(systems[s]) >= self.les_pme_atoms
+            )
+            if pme:  # key [-1, M0, M1, M2]: never an nmax
+                lkeys.append(
+                    [-1]
+                    + pme_mesh(
+                        row[9:12], self.les_sigma, self.les_pme_spacing,
+                        self.les_pme_order,
+                    )
+                )  # fmt: skip
+            else:
+                lkeys.append(nmax)
         cell_rows = [row[:9] for row in rows]
         grad = cells.requires_grad
         empty = _empty_plan()
@@ -377,9 +409,17 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
         if self.use_mesh:
             mesh_plan, meshes, _ = _groups(mkeys, periodic, cell_rows, grad)
         les_plan, kvecs = empty, torch.jit.annotate(List[torch.Tensor], [])
+        les_meshes = torch.jit.annotate(List[List[int]], [])
         if self.use_les:
             les_plan, nmaxs, seen = _groups(lkeys, periodic, cell_rows, grad)
             for g in range(len(nmaxs)):
+                if nmaxs[g][0] == -1:  # PME
+                    kvecs.append(
+                        torch.zeros(0, 3, dtype=cells.dtype, device=cells.device)
+                    )
+                    les_meshes.append(nmaxs[g][1:])
+                    continue
+                les_meshes.append(torch.jit.annotate(List[int], []))
                 # metrics G = cell cell^T rounded: rotated copies share the k-set
                 metric_keys: List[str] = []
                 mcells: List[List[float]] = []
@@ -399,7 +439,7 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
                     n = kset_host(nmaxs[g], mcells, kc)
                     self._kcache[ck] = n.to(device=cells.device, dtype=cells.dtype)
                 kvecs.append(self._kcache[ck])
-        return periodic, mesh_plan, meshes, les_plan, kvecs
+        return periodic, mesh_plan, meshes, les_plan, kvecs, les_meshes
 
     def atomic_energies(
         self,
@@ -418,6 +458,7 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
         les_plan: Plan,
         kvecs: List[torch.Tensor],
         pad_to: int = 0,
+        les_meshes: Optional[List[List[int]]] = None,
     ) -> torch.Tensor:
         """Per-atom energies from the padded token layout (slot 0 = centre).
 
@@ -498,11 +539,21 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
                 gi = _group_index(les_plan, g)
                 ids = les_plan[0][g]
                 cg, umap = _group_cells(cells, les_plan, g, gi)
-                eg = les_energy_periodic_batched(
-                    _rows(q_pad, ids, S, gi), _rows(pos_pad, ids, S, gi), cg, umap,
-                    kvecs[g], self.les_sigma, self.les_kcut,
-                    0 if self.training else self.les_chunk,
-                )  # fmt: skip
+                pme_size = torch.jit.annotate(List[int], [])
+                if les_meshes is not None:
+                    pme_size = les_meshes[g]
+                if len(pme_size) == 3:
+                    eg = les_energy_pme_batched(
+                        _rows(q_pad, ids, S, gi), _rows(pos_pad, ids, S, gi), cg,
+                        umap, pme_size, self.les_sigma, self.les_kcut,
+                        self.les_pme_order,
+                    )  # fmt: skip
+                else:
+                    eg = les_energy_periodic_batched(
+                        _rows(q_pad, ids, S, gi), _rows(pos_pad, ids, S, gi), cg,
+                        umap, kvecs[g], self.les_sigma, self.les_kcut,
+                        0 if self.training else self.les_chunk,
+                    )  # fmt: skip
                 e_pad = _put_rows(e_pad, eg, ids, S, gi)
             open_ids: List[int] = []
             for s in range(S):
@@ -556,14 +607,16 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
         mesh_plan, les_plan = empty, empty
         meshes: List[List[int]] = []
         kvecs: List[torch.Tensor] = []
+        les_meshes: List[List[int]] = []
         if self.use_les or self.use_mesh:
-            periodic, mesh_plan, meshes, les_plan, kvecs = self._long_range_plan(
-                cells, systems
+            periodic, mesh_plan, meshes, les_plan, kvecs, les_meshes = (
+                self._long_range_plan(cells, systems)
             )
 
         e = self.atomic_energies(
             positions, cells, periodic, sizes, sp_center, sp_nbr1, r, mask1, rev1,
             samples.values.to(torch.long), mesh_plan, meshes, les_plan, kvecs,
+            les_meshes=les_meshes,
         )  # fmt: skip
 
         return_dict: Dict[str, TensorMap] = {}

@@ -93,10 +93,13 @@ class CompiledTrainingStep:
         mesh_plan, les_plan = empty, empty
         meshes: List[List[int]] = []
         kvecs: List[torch.Tensor] = []
+        les_meshes: List[List[int]] = []
         if m.use_les or m.use_mesh:
-            periodic, mesh_plan, meshes, les_plan, kvecs = m._long_range_plan(
-                cells, systems
+            periodic, mesh_plan, meshes, les_plan, kvecs, les_meshes = (
+                m._long_range_plan(cells, systems)
             )
+        if any(len(x) > 0 for x in les_meshes):  # LES by PME: eager
+            return None
         n_periodic = sum(periodic)
         if n_periodic not in (0, S):
             return None
