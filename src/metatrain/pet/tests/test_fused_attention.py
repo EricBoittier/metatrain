@@ -123,7 +123,7 @@ def energy_forces_stress(model, systems, training: bool, create_graph: bool):
     forces = [-g for g in grads[: len(systems)]]
     stress = [
         g / torch.abs(torch.det(s.cell.detach()))
-        for g, s in zip(grads[len(systems) :], systems)
+        for g, s in zip(grads[len(systems) :], systems, strict=True)
         if bool(s.pbc.all())
     ]
     return energy, forces, stress
@@ -146,10 +146,12 @@ def test_energy_forces_stress(dtype, training):
     reference = "manual" if training else "auto"
     ref = energy_forces_stress(models[reference], systems, training, False)
     got = energy_forces_stress(models["fused"], systems, training, False)
-    for name, a, b in zip(("energy", "forces", "stress"), got, ref):
+    for name, a, b in zip(("energy", "forces", "stress"), got, ref, strict=True):
         a = [a] if isinstance(a, torch.Tensor) else a
         b = [b] if isinstance(b, torch.Tensor) else b
-        _, rel = max_diffs(a, b)
+        abs_diff, rel = max_diffs(a, b)
+        mode = "train/manual" if training else "eval/sdpa"
+        print(f"PARITY {dtype} {mode} {name}: abs {abs_diff:.3e} rel {rel:.3e}")
         assert rel < TOLERANCE[dtype], (name, rel)
 
 
@@ -174,7 +176,8 @@ def test_training_step_gradients(dtype):
     ref = grads(models["manual"])
     got = grads(models["fused"])
     assert len(ref) == len(got)
-    _, rel = max_diffs(got, ref)
+    abs_diff, rel = max_diffs(got, ref)
+    print(f"PARITY {dtype} param grads: abs {abs_diff:.3e} rel {rel:.3e}")
     assert rel < 5 * TOLERANCE[dtype], rel
 
 
@@ -240,6 +243,8 @@ def test_export(tmp_path):
     )
     loaded = torch.load(out)
     ref_e, ref_f, _ = energy_forces_stress(models["auto"], systems, False, False)
-    _, rel_e = max_diffs([loaded[0].reshape(-1)], [ref_e.cpu()])
-    _, rel_f = max_diffs(loaded[1:], [-f.cpu() for f in ref_f])
+    abs_e, rel_e = max_diffs([loaded[0].reshape(-1)], [ref_e.cpu()])
+    abs_f, rel_f = max_diffs(loaded[1:], [-f.cpu() for f in ref_f])
+    print(f"PARITY export energy: abs {abs_e:.3e} rel {rel_e:.3e}")
+    print(f"PARITY export forces: abs {abs_f:.3e} rel {rel_f:.3e}")
     assert rel_e < TOLERANCE[dtype] and rel_f < TOLERANCE[dtype], (rel_e, rel_f)
