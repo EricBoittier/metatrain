@@ -40,12 +40,14 @@ from .modules.ewald import (
 )
 from .modules.frames import platonic_group, relative_rotations, sample_frames
 from .modules.layers import (
+    FUSED_HEAD_DIMS,
     EdgeEmbed,
     FrameLinear,
     FrameMLP,
     MeshCoupling,
     PETLayer,
     cutoff_fn,
+    load_fused_attention_op,
     rope_cs,
 )
 
@@ -187,7 +189,7 @@ def _index_of(rows: List[List[float]], row: List[float]) -> int:
 
 
 class PlatoPETLR(ModelInterface[ModelHypers]):
-    __checkpoint_version__ = 4
+    __checkpoint_version__ = 5
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -301,6 +303,34 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
         # (atoms x k vectors) run in chunks of it (bounded memory, first derivatives)
         self.les_chunk = 2**25
         self._register_load_state_dict_pre_hook(_clear_caches, with_module=True)
+        self.attention_backend = "auto"
+        self.use_fused = False
+        self.set_attention_backend(str(h["attention_backend"]))
+
+    @torch.jit.unused
+    def set_attention_backend(self, backend: str) -> None:
+        """Select the attention (the ``attention_backend`` hyper; also for a loaded
+        model: the state dict does not depend on it). ``fused`` loads mlip.cpp's op
+        (:func:`~.modules.layers.load_fused_attention_op`); if that fails or the
+        head dimension is not supported it warns and behaves as ``auto``. Call it
+        before ``export`` / scripting: TorchScript sees the op only if it is used."""
+        if backend not in ("auto", "sdpa", "manual", "fused"):
+            raise ValueError(f"unknown attention_backend '{backend}'")
+        ch = int(self.hypers["d_model"]) // int(self.hypers["num_heads"])
+        fused = False
+        if backend == "fused":
+            if ch not in FUSED_HEAD_DIMS:
+                logging.warning(
+                    f"attention_backend 'fused' needs d_model / num_heads in "
+                    f"{FUSED_HEAD_DIMS}, got {ch}: using 'auto'"
+                )
+            else:
+                fused = load_fused_attention_op()
+        self.attention_backend = backend
+        self.hypers["attention_backend"] = backend
+        self.use_fused = fused
+        for layer in self.layers:
+            layer.set_fused(fused)
 
     @torch.jit.unused
     def clear_caches(self) -> None:
@@ -418,6 +448,7 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
         les_plan: Plan,
         kvecs: List[torch.Tensor],
         pad_to: int = 0,
+        allow_fused: bool = True,
     ) -> torch.Tensor:
         """Per-atom energies from the padded token layout (slot 0 = centre).
 
@@ -425,7 +456,8 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
         run on all structures at once in a ``(S, P)`` padded layout, per group of
         :meth:`_long_range_plan`; ``P = max(sizes)``, or ``pad_to`` if it is
         positive (then the padded layout is always used and only ``len(sizes)``
-        matters: the traced training graph of ``compile``)."""
+        matters: the traced training graph of ``compile``). ``allow_fused``: False
+        keeps the fused attention out (the traced graph of ``compile``)."""
         R, rel, w = self.frames()
         d = (r * r).sum(-1).clamp_min(1e-12).sqrt()
         fc = cutoff_fn(d, self.cutoff) * mask.to(r.dtype)
@@ -437,7 +469,22 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
             Rw = torch.einsum("fab,kb->fka", R, self.omega.to(r.dtype))
             ang = torch.einsum("akx,fcx->akfc", r, Rw)[:, :, :, None, :]
             cs = rope_cs(ang)
-        manual = self.training
+        manual = self.training  # 'auto': SDPA has no double backward
+        if self.attention_backend == "manual":
+            manual = True
+        elif self.attention_backend == "sdpa":
+            manual = False
+        # fused: CUDA float32 / float64 only, else as 'auto'; the (A, 1, K1, K1)
+        # bias is shared by every layer, head and frame
+        fused = (
+            self.use_fused
+            and allow_fused
+            and r.is_cuda
+            and (r.dtype == torch.float32 or r.dtype == torch.float64)
+        )
+        if fused:
+            K1 = bias.shape[-1]
+            bias = bias.expand(bias.shape[0], 1, K1, K1).contiguous()
         frame_w: Optional[torch.Tensor] = None
         if self.frame_mode == "attention":  # frames only in RoPE, one token frame
             frame_w = w
@@ -461,7 +508,7 @@ class PlatoPETLR(ModelInterface[ModelHypers]):
             if i == self.n_framed:  # average over frames, then one frame, no RoPE
                 tok = (tok * w[:, None]).sum(-2, keepdim=True)
                 rel, w, cs = self.I_rel, self.I_w, None
-            tok = layer(tok, rel, w, cs, bias, rev, manual, frame_w)
+            tok = layer(tok, rel, w, cs, bias, rev, manual, frame_w, fused)
             if i == self.couple_at and self.use_mesh and any_periodic:
                 x = tok[:, 0]
                 F = x.shape[1]

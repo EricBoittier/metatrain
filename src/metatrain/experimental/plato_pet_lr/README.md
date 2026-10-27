@@ -31,6 +31,25 @@ embedding's direction term is `sum_f w_f SiLU(W R_f^T r)`. Group invariance is
 exact because a group element permutes the frames. Smaller groups: `D2` (4, a
 subgroup of `T`), `C3`, `D3`.
 
+`attention_backend: fused` (`PETLayer` with `fused`, `pack_frame_heads`): mlip.cpp's
+`torch.ops.mlipcpp.pet_attention` (`torch_ext/`, fused CUDA kernels with exact first
+and second derivatives in C++, so force training and TorchScript work). Its bias is
+one `(L, L)` map shared by the heads; Plato's `log f_c` bias is per key, so the model
+expands it once per forward to `(A, 1, K1, K1)` and every layer, head and frame
+shares it. The `F` frames are folded into `F H` heads: `full` packs the per-frame
+`q, k, v`; attention-only frames rotate the one-frame `q, k` by every frame and
+repeat `v`, and the average of the `F` heads' outputs with `w_f` is exactly the
+frame-averaged attention (averaging the weights before `@ v` equals averaging
+after). No new kernel is needed. CPU / other dtypes, a missing op or an unsupported
+head dimension fall back to `auto`; `FusedAttention` is only a submodule when the
+op is registered, so a scripted model references it only then. Export: load the
+library first (`MLIPCPP_TORCH_LIB` or `mlipcpp_torch.load()`), then export; run with
+the library as a metatomic extension. The traced graph of `compile` keeps the
+PyTorch attention (`allow_fused=False`): the op's meta kernels are not
+symbolic-shape aware and its backward op has no autograd kernel of its own.
+Checkpoint v5 adds the hyper (v4 upgrades to `auto`); the state dict does not depend
+on it, and `set_attention_backend` switches a loaded model.
+
 `electronegativity: linear` ([`modules/electronegativity.py`](modules/electronegativity.py)):
 `E_chi = sum_i chi_i q_i` on the first latent channel, `chi_i = chi0[Z_i] + dchi_i`.
 The LES energy `1/2 q^T K q` is even in `q`, so without this term the charge sign is

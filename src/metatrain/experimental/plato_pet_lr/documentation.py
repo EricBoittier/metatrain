@@ -121,6 +121,21 @@ class ModelHypers(TypedDict):
     last ``1 / les_sigma`` keeps the energy smooth under strain."""
     seed: int = 0
     """Seed of the RoPE directions."""
+    attention_backend: Literal["auto", "sdpa", "manual", "fused"] = "auto"
+    """Attention implementation; all give the same model. ``auto``: manual softmax
+    when training (it has a double backward, for force losses) and
+    ``scaled_dot_product_attention`` in evaluation. ``manual`` / ``sdpa``: always
+    that one (SDPA cannot train on forces). Without ``fused``, the frame average of
+    ``frame_mode: attention`` is always the manual softmax. ``fused``: mlip.cpp's
+    fused CUDA kernels (``torch.ops.mlipcpp.pet_attention``: exact first and
+    second derivatives, no ``K1 x K1`` matrix per head stored), with the frames
+    folded into ``F x num_heads`` heads that share the cutoff bias. Needs
+    ``d_model / num_heads`` in 8, 16, 32, 64 and the op: the shared library named
+    by ``MLIPCPP_TORCH_LIB``, or the ``mlipcpp_torch`` package (mlip.cpp
+    ``torch_ext``). Without them, and for CPU or other dtypes, ``fused`` falls
+    back to ``auto``. An exported model
+    keeps the backend it was exported with; load the library as a metatomic
+    extension to run it. Not used in the traced graph of ``compile``."""
 
 
 ##############################

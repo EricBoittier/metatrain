@@ -3,6 +3,8 @@ is the centre atom, slots 1.. its neighbours. ``rel`` is ``(F, F, 9)`` and ``w``
 ``(F,)`` (see ``frames.py``)."""
 
 import math
+import os
+import warnings
 from typing import List, Optional
 
 import torch
@@ -273,6 +275,90 @@ def frame_averaged_attention_qkv(
     return (p @ v).transpose(1, 2).reshape(A, K1, d)
 
 
+# head dimensions (d_model / num_heads) of torch.ops.mlipcpp.pet_attention
+FUSED_HEAD_DIMS: List[int] = [8, 16, 32, 64]
+
+
+def fused_attention_op_available() -> bool:
+    """Whether ``torch.ops.mlipcpp.pet_attention`` (mlip.cpp's fused attention, see
+    :func:`load_fused_attention_op`) is registered in this process."""
+    try:
+        torch.ops.mlipcpp.pet_attention
+    except (AttributeError, RuntimeError):
+        return False
+    return True
+
+
+def load_fused_attention_op() -> bool:
+    """Register ``torch.ops.mlipcpp.pet_attention`` if needed: from the library named
+    by ``MLIPCPP_TORCH_LIB``, or else ``mlipcpp_torch.load()`` (mlip.cpp
+    ``torch_ext/``, builds the library on first use). Returns whether it is
+    available; a failure is a warning (the model falls back to the other paths)."""
+    if fused_attention_op_available():
+        return True
+    lib = os.environ.get("MLIPCPP_TORCH_LIB")
+    try:
+        if lib:
+            torch.ops.load_library(lib)
+        else:
+            import mlipcpp_torch  # noqa: PLC0415
+
+            mlipcpp_torch.load()
+    except Exception as e:  # noqa: BLE001
+        warnings.warn(
+            "attention_backend 'fused': could not load torch.ops.mlipcpp."
+            f"pet_attention ({type(e).__name__}: {e}); using the default attention",
+            stacklevel=2,
+        )
+        return False
+    return fused_attention_op_available()
+
+
+class FusedAttention(torch.nn.Module):
+    """``torch.ops.mlipcpp.pet_attention``: per head ``softmax(scale q k^T + bias) v``
+    of a packed ``(N, L, 3, heads * d)`` projection, ``bias`` ``(N, 1, L, L)`` shared
+    by the heads; returns ``(N, L, heads * d)``. Exact first and second derivatives
+    in C++ (force training, TorchScript), CUDA float32 / float64. Only instantiated
+    when the op is registered, so TorchScript sees the op only when it exists."""
+
+    def forward(
+        self, qkv: torch.Tensor, bias: torch.Tensor, heads: int, scale: float
+    ) -> torch.Tensor:
+        return torch.ops.mlipcpp.pet_attention(qkv, bias, heads, scale)[0]
+
+
+class NoFusedAttention(torch.nn.Module):
+    """Stands in for :class:`FusedAttention` when the op is not used."""
+
+    def forward(
+        self, qkv: torch.Tensor, bias: torch.Tensor, heads: int, scale: float
+    ) -> torch.Tensor:
+        raise RuntimeError("torch.ops.mlipcpp.pet_attention is not available")
+
+
+def pack_frame_heads(
+    qkv: torch.Tensor, cs: Optional[torch.Tensor], H: int
+) -> torch.Tensor:
+    """The fused op's ``(A, K1, 3, F d)`` input, with the ``F`` frames folded into
+    ``F H`` heads (head ``f H + h``) that share the ``(A, K1, K1)`` bias.
+
+    ``qkv`` is ``(A, K1, F0, 3 d)``: ``F0 = F`` token frames (``full``), or one
+    (attention-only frames: ``q, k`` are rotated by each of the ``F`` frames of
+    ``cs`` and ``v`` is shared). Then ``sum_f w_f softmax(RoPE_f(q) RoPE_f(k)^T +
+    bias) v`` is the frame average of the ``F`` heads' outputs (the average of the
+    weights before ``@ v`` equals the average after)."""
+    x = qkv
+    A, K1, F0, d3 = x.shape
+    d = d3 // 3
+    qk = x[..., : 2 * d]
+    if cs is not None:
+        qk = apply_rope_cs(qk.reshape(A, K1, F0, 2 * H, d // H), cs)
+    F = qk.shape[2]
+    qk = qk.reshape(A, K1, F, 2, d).transpose(2, 3).reshape(A, K1, 2, F * d)
+    v = x[..., 2 * d :].expand(A, K1, F, d).reshape(A, K1, 1, F * d)
+    return torch.cat([qk, v], 2)
+
+
 class PETLayer(torch.nn.Module):
     """Edge-reversal merge, self-attention over a centre's tokens (RoPE on r_ij,
     ``log f_c`` bias), MLP; every linear map is a ``FrameLinear``.
@@ -293,6 +379,11 @@ class PETLayer(torch.nn.Module):
         self.proj = FrameLinear(d, d, n_basis, hidden, mode=mode)
         self.mlp1 = FrameLinear(d, 2 * d, n_basis, hidden, mode=mode)
         self.mlp2 = FrameLinear(2 * d, d, n_basis, hidden, mode=mode)
+        self.fused_attention: torch.nn.Module = NoFusedAttention()
+
+    @torch.jit.unused
+    def set_fused(self, enabled: bool) -> None:
+        self.fused_attention = FusedAttention() if enabled else NoFusedAttention()
 
     def forward(
         self,
@@ -304,7 +395,11 @@ class PETLayer(torch.nn.Module):
         rev: torch.Tensor,
         manual: bool,
         frame_w: Optional[torch.Tensor] = None,
+        fused: bool = False,
     ) -> torch.Tensor:
+        """``fused``: attention by :class:`FusedAttention` (the model checks that it
+        applies: op registered, CUDA, float32 / float64, ``bias`` ``(A, 1, K1,
+        K1)``); else ``manual`` softmax or SDPA."""
         A, K1, F, d = tok.shape
         H = self.h
         Ch = d // H
@@ -312,6 +407,15 @@ class PETLayer(torch.nn.Module):
         t_rev = t.reshape(A * K1, F, d).index_select(0, rev).reshape(A, K1, F, d)
         x = tok + self.merge(torch.cat([t, t_rev], -1), rel, w)
         qkv = self.qkv(self.n1(x), rel, w)
+        if fused:
+            packed = pack_frame_heads(qkv, cs, H)  # (A, K1, 3, Fh d)
+            Fh = packed.shape[-1] // d
+            o = self.fused_attention(packed, bias, Fh * H, 1.0 / math.sqrt(Ch))
+            o = o.reshape(A, K1, Fh, d)
+            if frame_w is not None and cs is not None:  # attention-only frames
+                o = (o * frame_w[:, None]).sum(2, keepdim=True)
+            x = x + self.proj(o, rel, w)
+            return x + self.mlp2(Fn.silu(self.mlp1(self.n2(x), rel, w)), rel, w)
         if frame_w is not None and cs is not None:
             o = frame_averaged_attention_qkv(
                 qkv.reshape(A, K1, 3 * d), cs, frame_w, bias, H

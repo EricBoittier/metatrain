@@ -199,6 +199,7 @@ class CompiledTrainingStep:
                     sp_nbr1, r,
                     mask1, rev1, system_atom, traced_plan(mesh_index), meshes,
                     traced_plan(les_index), kvecs, pad_to=pad_like.shape[1],
+                    allow_fused=False,
                 )  # fmt: skip
                 E = torch.zeros(S, dtype=e.dtype, device=e.device).index_add(
                     0, system_atom[:, 0], e
@@ -217,6 +218,13 @@ class CompiledTrainingStep:
         from torch.fx.experimental.proxy_tensor import make_fx
 
         logging.info(f"Plato-PET-LR: tracing and compiling the training graph {key}")
+        if self.model.use_fused:
+            logging.info(
+                "Plato-PET-LR: the compiled graph uses the PyTorch attention, not "
+                "attention_backend 'fused' (the mlipcpp op has no symbolic-shape "
+                "meta kernels and no autograd for its backward op, which the "
+                "traced force graph needs); eager batches use the fused op"
+            )
         fn = self._function(key[0], prep["plan"])
         args = list(prep["inputs"].values())
         with _disable_fx_duck_shape():
