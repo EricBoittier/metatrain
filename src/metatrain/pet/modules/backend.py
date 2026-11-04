@@ -6,6 +6,7 @@ import torch
 from ..documentation import ModelHypers
 from .conditioning import SystemConditioningEmbedding
 from .plato_lr import PETLES, PETMeshCoupling, apply_plato_lr
+from .soap import PETSoapHead, SoapPowerSpectrum, apply_soap
 from .structures import compute_batch_tensors
 from .transformer import CartesianTransformer
 
@@ -163,9 +164,14 @@ class PETBackend(torch.nn.Module):
         self.mesh: Optional[PETMeshCoupling] = None
         self.les: Optional[PETLES] = None
         self.les_targets: List[str] = []
+        # SOAP-PET (``plato_lr`` hypers' ``soap`` dict, ``modules/soap.py``)
+        self.soap: Optional[SoapPowerSpectrum] = None
+        self.soap_head: Optional[PETSoapHead] = None
         plato_lr = hypers.get("plato_lr")
         if plato_lr is not None:
             apply_plato_lr(self, dict(plato_lr))
+            if plato_lr.get("soap"):
+                apply_soap(self, dict(plato_lr["soap"]))
         self.needs_long_range_inputs = self.mesh is not None or self.les is not None
 
     def add_output(self, target_name: str, output_shapes: Dict[str, List[int]]) -> None:
@@ -471,6 +477,11 @@ class PETBackend(torch.nn.Module):
         """
         padding_mask = batch_data["padding_mask"]
         cutoff_factors = batch_data["cutoff_factors"]
+        soap_energy: Optional[torch.Tensor] = None
+        if self.soap is not None and self.soap_head is not None:
+            p = self.soap(batch_data["edge_vectors"], ~padding_mask,
+                          batch_data["element_indices_neighbors"], batch_data["element_indices_nodes"])
+            soap_energy = self.soap_head(p, batch_data["element_indices_nodes"])
 
         node_ll_features, edge_ll_features = self._calculate_last_layer_features(
             node_features_list,
@@ -530,6 +541,9 @@ class PETBackend(torch.nn.Module):
                         else None,
                     )[:, None]
                 )
+
+            if soap_energy is not None and output_name in self.les_targets:
+                block_sums[0] = block_sums[0] + soap_energy[:, None]  # SOAP-PET head
 
             atomic_predictions[output_name] = block_sums
 

@@ -211,6 +211,11 @@ class PlatoLRHypers(TypedDict):
     """LES tail: subtract the within-cutoff part, ``1/2 sum over the neighbour list of
     q_i q_j erf(r / (sqrt 2 les_tail_sigma)) / r f_c(r)`` (PET's cutoff function), so that
     LES adds almost nothing inside the cutoff."""
+    soap: Optional[dict] = None
+    """SOAP-PET (``modules/soap.py``): ``None`` (off) or a dict with the power spectrum
+    (``cutoff`` 5.0, ``l_max`` 4, ``n_max`` 6, ``n_embed`` 4) and the variants on it, each
+    behind a zero gate: ``head`` (an additive SOAP-BPNN atomic energy, ``head_hidden``
+    128)."""
     seed: int = 0
     """Seed of the RoPE directions."""
 

@@ -159,3 +159,32 @@ def soap_on_edges_from_reverse(p: torch.Tensor, reverse_neighbor_index: torch.Te
     n_atoms = p.shape[0]
     rep = p[:, None, :].expand(n_atoms, n_nbr, p.shape[1]).reshape(n_atoms * n_nbr, p.shape[1])
     return rep[reverse_neighbor_index.reshape(-1)].reshape(n_atoms, n_nbr, p.shape[1])
+
+
+class PETSoapHead(torch.nn.Module):
+    """SOAP-PET variant 3: an additive SOAP-BPNN atomic energy, gate * MLP([p_i, e(Z_i)]),
+    the gate a scalar starting at 0 (the model starts as the pretrained PET)."""
+
+    def __init__(self, soap_dim: int, n_species: int, hidden: int = 128, n_center: int = 8) -> None:
+        super().__init__()
+        self.center_embedding = torch.nn.Embedding(n_species, n_center)
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(soap_dim + n_center, hidden), torch.nn.SiLU(),
+            torch.nn.Linear(hidden, hidden), torch.nn.SiLU(), torch.nn.Linear(hidden, 1))
+        self.head_gate = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, p: torch.Tensor, center_species: torch.Tensor) -> torch.Tensor:
+        """p (n_atoms, D), center_species (n_atoms,) -> per-atom energy (n_atoms,)."""
+        x = torch.cat([p, self.center_embedding(center_species)], -1)
+        return self.head_gate * self.mlp(x).squeeze(-1)
+
+
+def apply_soap(backend: torch.nn.Module, h: dict) -> None:
+    """Add the SOAP-PET components of the ``plato_lr`` hypers' ``soap`` dict to a
+    PETBackend: the shared ``backend.soap`` power spectrum, and per variant its module
+    (``head``: :class:`PETSoapHead` as ``backend.soap_head``)."""
+    n_species = backend.edge_embedder.num_embeddings
+    backend.soap = SoapPowerSpectrum(float(h.get("cutoff", 5.0)), n_species, int(h.get("l_max", 4)),
+                                     int(h.get("n_max", 6)), int(h.get("n_embed", 4)))
+    if h.get("head", False):
+        backend.soap_head = PETSoapHead(backend.soap.out_dim, n_species, int(h.get("head_hidden", 128)))
