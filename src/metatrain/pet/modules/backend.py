@@ -479,8 +479,10 @@ class PETBackend(torch.nn.Module):
         cutoff_factors = batch_data["cutoff_factors"]
         soap_energy: Optional[torch.Tensor] = None
         if self.soap is not None and self.soap_head is not None:
+            # densities weighted by PET's cutoff factors: smooth under the adaptive cutoff
             p = self.soap(batch_data["edge_vectors"], ~padding_mask,
-                          batch_data["element_indices_neighbors"], batch_data["element_indices_nodes"])
+                          batch_data["element_indices_neighbors"], batch_data["element_indices_nodes"],
+                          cutoff_factors)
             soap_energy = self.soap_head(p, batch_data["element_indices_nodes"])
 
         node_ll_features, edge_ll_features = self._calculate_last_layer_features(

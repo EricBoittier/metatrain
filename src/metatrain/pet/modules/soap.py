@@ -21,7 +21,7 @@ reversed-neighbour index (no neighbour-atom index needed, as in the exported gra
 """
 
 import math
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -33,7 +33,8 @@ def _stack(xs: List[torch.Tensor]) -> torch.Tensor:
 def _real_sh(u: torch.Tensor, l_max: int) -> List[torch.Tensor]:
     """Orthonormal real spherical harmonics of unit vectors ``u`` (..., 3), one tensor
     (..., 2l+1) per l <= l_max (l_max <= 4), m = -l..l."""
-    x, y, z = u[..., 0], u[..., 1], u[..., 2]
+    # contiguous components: ggml's scale needs contiguous inputs (mlip.cpp export)
+    x, y, z = u[..., 0].contiguous(), u[..., 1].contiguous(), u[..., 2].contiguous()
     out = [torch.ones_like(x)[..., None] * 0.28209479177387814]
     if l_max >= 1:
         c = 0.4886025119029199
@@ -95,6 +96,13 @@ class SoapPowerSpectrum(torch.nn.Module):
         with torch.no_grad():  # O(1) channel weights, every species distinct
             self.species_embedding.weight.normal_(0.0, 1.0)
         self.register_buffer("centers", torch.linspace(0.0, self.cutoff, self.n_max))
+        self.register_buffer("ones_row", torch.ones(1, self.n_max))
+        self.register_buffer("ones3", torch.ones(1, 3))
+        # channel a = n * n_embed + k from constant 0/1 maps (repeat g_n, tile e_k): a 3D
+        # matmul and a product of equal shapes rather than a 4D outer product (mlip.cpp)
+        a = torch.arange(self.n_max * self.n_embed)
+        self.register_buffer("rep_radial", (a[None, :] // self.n_embed == torch.arange(self.n_max)[:, None]).to(torch.get_default_dtype()))
+        self.register_buffer("tile_embed", (a[None, :] % self.n_embed == torch.arange(self.n_embed)[:, None]).to(torch.get_default_dtype()))
         self.width = self.cutoff / self.n_max
         C = self.n_max * self.n_embed
         iu = torch.triu_indices(C, C)
@@ -105,46 +113,56 @@ class SoapPowerSpectrum(torch.nn.Module):
         self.register_buffer("triu_select", sel)
         self.n_channels = C
         self.out_dim = (self.l_max + 1) * int(iu.shape[1])
+        self.register_buffer("ones_out", torch.ones(1, self.out_dim))
 
     def radial(self, r: torch.Tensor) -> torch.Tensor:
         """Radial basis with the cutoff: g_n(r) f_c(r), (...,) -> (..., n_max)."""
         fc = 0.5 * (1.0 + torch.cos(math.pi * torch.clamp(r / self.cutoff, 0.0, 1.0)))
-        d = (r[..., None] - self.centers) / self.width
+        # outer products as matmuls: ggml broadcasts only the second operand of a binary op
+        # and the exported expand of dynamic shapes is unreliable (mlip.cpp export)
+        d = (r[..., None] @ self.ones_row - self.centers) / self.width
         return torch.exp(-0.5 * d * d) * fc[..., None]
 
     def real_sph(self, xyz: torch.Tensor) -> torch.Tensor:
         """Orthonormal real SH of the direction of xyz, (..., 3) -> (..., (l_max+1)^2),
         ordered l = 0..l_max, m = -l..l."""
-        r = torch.sqrt((xyz * xyz).sum(-1, keepdim=True) + 1e-12)
+        # the norm at full shape (ones-row matmul): ggml's DIV backward cannot reduce a broadcast
+        r = torch.sqrt((xyz * xyz).sum(-1, keepdim=True) + 1e-12) @ self.ones3
         return torch.cat(_real_sh(xyz / r, self.l_max), -1)
 
     def spherical_expansion(self, edge_vectors: torch.Tensor, padding_mask: torch.Tensor,
-                            neighbor_species: torch.Tensor,
-                            center_species: torch.Tensor) -> torch.Tensor:
-        """Density coefficients c_{a,lm} = sum_j g_n(r_ij) f_c(r_ij) e_k(Z_j) Y_lm(r^_ij),
-        (n_atoms, C, (l_max+1)^2), channel a = n * n_embed + k (padded slots excluded)."""
+                            neighbor_species: torch.Tensor, center_species: torch.Tensor,
+                            weight: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Density coefficients c_{a,lm} = sum_j w_ij g_n(r_ij) f_c(r_ij) e_k(Z_j) Y_lm(r^_ij),
+        (n_atoms, C, (l_max+1)^2), channel a = n * n_embed + k (padded slots excluded).
+        weight (n_atoms, n_nbr), e.g. PET's cutoff_factors (smooth under its adaptive
+        cutoff); None: 1."""
         n_atoms, n_nbr = edge_vectors.shape[0], edge_vectors.shape[1]
         r = torch.sqrt((edge_vectors * edge_vectors).sum(-1) + 1e-12)
         g = self.radial(r)
+        if weight is not None:
+            g = g * weight[..., None]
         g = torch.where(padding_mask[..., None], torch.zeros_like(g), g)
         e = self.species_embedding(neighbor_species)
-        a = (g[..., :, None] * e[..., None, :]).reshape(n_atoms, n_nbr, self.n_channels)
-        return torch.bmm(a.transpose(1, 2), self.real_sph(edge_vectors))
+        a = (g @ self.rep_radial) * (e @ self.tile_embed)  # (n, m, C)
+        return torch.bmm(a.transpose(1, 2).contiguous(), self.real_sph(edge_vectors))  # (contiguous: mlip.cpp)
 
     def forward(self, edge_vectors: torch.Tensor, padding_mask: torch.Tensor,
-                neighbor_species: torch.Tensor, center_species: torch.Tensor) -> torch.Tensor:
+                neighbor_species: torch.Tensor, center_species: torch.Tensor,
+                weight: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Unit-normalised power spectrum (n_atoms, out_dim): per l, the upper triangle of
         p_{ab,l} = (2l+1)^{-1/2} sum_m c_{a,lm} c_{b,lm} of :meth:`spherical_expansion`.
-        center_species is unused (the power spectrum is centre-agnostic)."""
-        c = self.spherical_expansion(edge_vectors, padding_mask, neighbor_species, center_species)
+        center_species is unused (the power spectrum is centre-agnostic); weight: as in
+        :meth:`spherical_expansion`."""
+        c = self.spherical_expansion(edge_vectors, padding_mask, neighbor_species, center_species, weight)
         n_atoms = c.shape[0]
         parts: List[torch.Tensor] = []
         for l in range(self.l_max + 1):
-            cl = c[:, :, l * l:(l + 1) * (l + 1)]
-            pl = torch.bmm(cl, cl.transpose(1, 2)) * (2 * l + 1) ** -0.5
+            cl = c[:, :, l * l:(l + 1) * (l + 1)].contiguous()  # (mlip.cpp: no strided matmul operands)
+            pl = torch.bmm(cl, cl.transpose(1, 2).contiguous()) * (2 * l + 1) ** -0.5
             parts.append(pl.reshape(n_atoms, -1) @ self.triu_select)
         p = torch.cat(parts, -1)
-        return p / torch.sqrt((p * p).sum(-1, keepdim=True) + 1e-12)
+        return p / (torch.sqrt((p * p).sum(-1, keepdim=True) + 1e-12) @ self.ones_out)
 
 
 def soap_on_edges(p: torch.Tensor, neighbor_index: torch.Tensor) -> torch.Tensor:
@@ -180,7 +198,7 @@ class PETSoapHead(torch.nn.Module):
     def forward(self, p: torch.Tensor, center_species: torch.Tensor) -> torch.Tensor:
         """p (n_atoms, D), center_species (n_atoms,) -> per-atom energy (n_atoms,)."""
         x = torch.cat([p, self.center_embedding(center_species)], -1)
-        return self.head_gate * self.mlp(x).squeeze(-1)
+        return self.mlp(x).squeeze(-1) * self.head_gate
 
 
 def apply_soap(backend: torch.nn.Module, h: dict) -> None:
