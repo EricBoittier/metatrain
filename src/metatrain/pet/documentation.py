@@ -140,7 +140,7 @@ important** (in decreasing order of importance):
       :no-index:
 """
 
-from typing import Literal, Optional
+from typing import Any, Dict, Literal, Optional
 
 from typing_extensions import NotRequired, TypedDict
 
@@ -218,6 +218,11 @@ class PlatoLRHypers(TypedDict):
     128)."""
     seed: int = 0
     """Seed of the RoPE directions."""
+    soap_node: Optional[Dict[str, Any]] = None
+    """SOAP-PET variant 1 (``modules/soap_node.py``): the SOAP power spectrum through a
+    gated, zero-initialised MLP onto the node features; keys ``layers`` ("input", "all"
+    or a list of injection points), ``d_hidden``, ``cutoff``, ``l_max``, ``n_max``,
+    ``n_embed``. None: off."""
 
 
 class ModelHypers(TypedDict):

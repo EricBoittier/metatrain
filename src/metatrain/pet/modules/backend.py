@@ -7,6 +7,7 @@ from ..documentation import ModelHypers
 from .conditioning import SystemConditioningEmbedding
 from .plato_lr import PETLES, PETMeshCoupling, apply_plato_lr
 from .soap import PETSoapHead, SoapPowerSpectrum, apply_soap
+from .soap_node import SoapNodeInjection, apply_soap_node
 from .structures import compute_batch_tensors
 from .transformer import CartesianTransformer
 
@@ -164,14 +165,17 @@ class PETBackend(torch.nn.Module):
         self.mesh: Optional[PETMeshCoupling] = None
         self.les: Optional[PETLES] = None
         self.les_targets: List[str] = []
-        # SOAP-PET (``plato_lr`` hypers' ``soap`` dict, ``modules/soap.py``)
+        # SOAP-PET (``plato_lr`` hypers' ``soap*`` dicts, ``modules/soap*.py``)
         self.soap: Optional[SoapPowerSpectrum] = None
         self.soap_head: Optional[PETSoapHead] = None
+        self.soap_node: Optional[SoapNodeInjection] = None
         plato_lr = hypers.get("plato_lr")
         if plato_lr is not None:
             apply_plato_lr(self, dict(plato_lr))
             if plato_lr.get("soap"):
                 apply_soap(self, dict(plato_lr["soap"]))
+            if plato_lr.get("soap_node"):
+                apply_soap_node(self, dict(plato_lr["soap_node"]))
         self.needs_long_range_inputs = self.mesh is not None or self.les is not None
 
     def add_output(self, target_name: str, output_shapes: Dict[str, List[int]]) -> None:
@@ -590,6 +594,19 @@ class PETBackend(torch.nn.Module):
             inputs["system_indices"],
         )
 
+    def _soap_node_features(self, inputs: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        """SOAP-PET variant 1: the normalised power spectrum for the node injections."""
+        if self.soap is None or self.soap_node is None:
+            return None
+        p = self.soap(inputs["edge_vectors"], ~inputs["padding_mask"], inputs["element_indices_neighbors"],
+                      inputs["element_indices_nodes"], inputs["cutoff_factors"])
+        return self.soap_node.features(p)
+
+    def _soap_node_update(self, x: torch.Tensor, pn: Optional[torch.Tensor], point: int) -> torch.Tensor:
+        if pn is None or self.soap_node is None:
+            return x
+        return self.soap_node.update(x, pn, point)
+
     def _feedforward_featurization_impl(
         self, inputs: Dict[str, torch.Tensor], use_manual_attention: bool
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
@@ -610,6 +627,8 @@ class PETBackend(torch.nn.Module):
         edge_features_list: List[torch.Tensor] = []
 
         input_node_embeddings = self.node_embedders[0](inputs["element_indices_nodes"])
+        soap_pn = self._soap_node_features(inputs)
+        input_node_embeddings = self._soap_node_update(input_node_embeddings, soap_pn, 0)
         input_edge_embeddings = self.edge_embedder(inputs["element_indices_neighbors"])
         # Compute conditioning embedding once: same inputs at every GNN layer.
         cond_embedding: Optional[torch.Tensor] = None
@@ -658,7 +677,9 @@ class PETBackend(torch.nn.Module):
             # using a reversed neighbor list, so the new input message
             # from atom `j` to atom `i` in on the GNN layer N+1 is a
             # reversed message from atom `i` to atom `j` on the GNN layer N.
-            input_node_embeddings = output_node_embeddings
+            input_node_embeddings = self._soap_node_update(
+                output_node_embeddings, soap_pn, layer_index + 1
+            )
             new_input_edge_embeddings = output_edge_embeddings.reshape(
                 output_edge_embeddings.shape[0] * output_edge_embeddings.shape[1],
                 output_edge_embeddings.shape[2],
@@ -715,10 +736,13 @@ class PETBackend(torch.nn.Module):
                 inputs["spin_multiplicity"],
                 inputs["system_indices"],
             )
+        soap_pn = self._soap_node_features(inputs)
         for layer_index, (node_embedder, gnn_layer) in enumerate(
             zip(self.node_embedders, self.gnn_layers, strict=True)
         ):
-            input_node_embeddings = node_embedder(inputs["element_indices_nodes"])
+            input_node_embeddings = self._soap_node_update(
+                node_embedder(inputs["element_indices_nodes"]), soap_pn, layer_index
+            )
             output_node_embeddings, output_edge_embeddings = gnn_layer(
                 input_node_embeddings,
                 input_edge_embeddings,
