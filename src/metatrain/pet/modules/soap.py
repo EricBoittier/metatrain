@@ -86,8 +86,13 @@ class SoapPowerSpectrum(torch.nn.Module):
     """
 
     def __init__(self, cutoff: float, n_species: int, l_max: int = 4, n_max: int = 6,
-                 n_embed: int = 4) -> None:
+                 n_embed: int = 4, normalize: str = "unit") -> None:
         super().__init__()
+        if normalize not in ("unit", "sqrtD", "none"):
+            raise ValueError(f"normalize must be unit, sqrtD or none, not {normalize}")
+        # unit: |p| = 1 per atom (default); sqrtD: |p| = sqrt(out_dim), components O(1) as a
+        # default-init Linear expects; none: the raw power spectrum
+        self.normalize = normalize
         self.cutoff = float(cutoff)
         self.l_max = int(l_max)
         self.n_max = int(n_max)
@@ -162,7 +167,10 @@ class SoapPowerSpectrum(torch.nn.Module):
             pl = torch.bmm(cl, cl.transpose(1, 2).contiguous()) * (2 * l + 1) ** -0.5
             parts.append(pl.reshape(n_atoms, -1) @ self.triu_select)
         p = torch.cat(parts, -1)
-        return p / (torch.sqrt((p * p).sum(-1, keepdim=True) + 1e-12) @ self.ones_out)
+        if self.normalize == "none":
+            return p
+        p = p / (torch.sqrt((p * p).sum(-1, keepdim=True) + 1e-12) @ self.ones_out)
+        return p * math.sqrt(self.out_dim) if self.normalize == "sqrtD" else p
 
 
 def soap_on_edges(p: torch.Tensor, neighbor_index: torch.Tensor) -> torch.Tensor:
@@ -184,8 +192,10 @@ def soap_on_edges_from_reverse(p: torch.Tensor, reverse_neighbor_index: torch.Te
 
 
 class PETSoapHead(torch.nn.Module):
-    """SOAP-PET variant 3: an additive SOAP-BPNN atomic energy, gate * MLP([p_i, e(Z_i)]),
-    the gate a scalar starting at 0 (the model starts as the pretrained PET)."""
+    """SOAP-PET variant 3: an additive SOAP-BPNN atomic energy, gate * MLP([sqrt(D) p_i, e(Z_i)]),
+    the gate a scalar starting at 0 (the model starts as the pretrained PET). The unit p is
+    scaled by sqrt(D) so its components are O(1) for the default-init first Linear (unit p:
+    the head is ~ a per-species constant, within-species spread 0.3 meV/atom at gate 1)."""
 
     def __init__(self, soap_dim: int, n_species: int, hidden: int = 128, n_center: int = 8) -> None:
         super().__init__()
@@ -194,10 +204,11 @@ class PETSoapHead(torch.nn.Module):
             torch.nn.Linear(soap_dim + n_center, hidden), torch.nn.SiLU(),
             torch.nn.Linear(hidden, hidden), torch.nn.SiLU(), torch.nn.Linear(hidden, 1))
         self.head_gate = torch.nn.Parameter(torch.zeros(1))
+        self.input_scale = math.sqrt(soap_dim)
 
     def forward(self, p: torch.Tensor, center_species: torch.Tensor) -> torch.Tensor:
         """p (n_atoms, D), center_species (n_atoms,) -> per-atom energy (n_atoms,)."""
-        x = torch.cat([p, self.center_embedding(center_species)], -1)
+        x = torch.cat([p * self.input_scale, self.center_embedding(center_species)], -1)
         return self.mlp(x).squeeze(-1) * self.head_gate
 
 
@@ -207,6 +218,7 @@ def apply_soap(backend: torch.nn.Module, h: dict) -> None:
     (``head``: :class:`PETSoapHead` as ``backend.soap_head``)."""
     n_species = backend.edge_embedder.num_embeddings
     backend.soap = SoapPowerSpectrum(float(h.get("cutoff", 5.0)), n_species, int(h.get("l_max", 4)),
-                                     int(h.get("n_max", 6)), int(h.get("n_embed", 4)))
+                                     int(h.get("n_max", 6)), int(h.get("n_embed", 4)),
+                                     str(h.get("normalize", "unit")))
     if h.get("head", False):
         backend.soap_head = PETSoapHead(backend.soap.out_dim, n_species, int(h.get("head_hidden", 128)))
