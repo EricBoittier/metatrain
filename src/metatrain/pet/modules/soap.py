@@ -10,7 +10,7 @@ the same ``(n_atoms, max_neighbors)`` edge layout PET uses (no separate neighbou
 - power spectrum ``p_{ab,l} = (2l+1)^{-1/2} sum_m c_{a,lm} c_{b,lm}``, upper triangle
   ``a <= b`` per ``l``, then normalised to unit length per atom.
 
-Only plain torch ops (mul / add / bmm / index_select / sqrt / cos), so the mlip.cpp
+Only plain torch ops (mul / add / bmm / matmul / sqrt / cos), so the mlip.cpp
 GGUF exporter traces it into an ordinary GIR graph. The output dimension is
 ``out_dim = (l_max + 1) * C (C + 1) / 2`` with ``C = n_max * n_embed`` (1500 for the
 defaults).
@@ -98,9 +98,13 @@ class SoapPowerSpectrum(torch.nn.Module):
         self.width = self.cutoff / self.n_max
         C = self.n_max * self.n_embed
         iu = torch.triu_indices(C, C)
-        self.register_buffer("triu", (iu[0] * C + iu[1]).to(torch.int32))
+        # upper-triangle selection as a float one-hot matmul (C*C, T): no integer buffer
+        # (the GGUF export has no int tensors)
+        sel = torch.zeros(C * C, iu.shape[1])
+        sel[iu[0] * C + iu[1], torch.arange(iu.shape[1])] = 1.0
+        self.register_buffer("triu_select", sel)
         self.n_channels = C
-        self.out_dim = (self.l_max + 1) * int(self.triu.numel())
+        self.out_dim = (self.l_max + 1) * int(iu.shape[1])
 
     def radial(self, r: torch.Tensor) -> torch.Tensor:
         """Radial basis with the cutoff: g_n(r) f_c(r), (...,) -> (..., n_max)."""
@@ -138,7 +142,7 @@ class SoapPowerSpectrum(torch.nn.Module):
         for l in range(self.l_max + 1):
             cl = c[:, :, l * l:(l + 1) * (l + 1)]
             pl = torch.bmm(cl, cl.transpose(1, 2)) * (2 * l + 1) ** -0.5
-            parts.append(torch.index_select(pl.reshape(n_atoms, -1), 1, self.triu))
+            parts.append(pl.reshape(n_atoms, -1) @ self.triu_select)
         p = torch.cat(parts, -1)
         return p / torch.sqrt((p * p).sum(-1, keepdim=True) + 1e-12)
 
