@@ -98,7 +98,7 @@ class SoapPowerSpectrum(torch.nn.Module):
         self.width = self.cutoff / self.n_max
         C = self.n_max * self.n_embed
         iu = torch.triu_indices(C, C)
-        self.register_buffer("triu", (iu[0] * C + iu[1]).to(torch.long))
+        self.register_buffer("triu", (iu[0] * C + iu[1]).to(torch.int32))
         self.n_channels = C
         self.out_dim = (self.l_max + 1) * int(self.triu.numel())
 
