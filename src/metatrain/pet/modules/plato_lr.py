@@ -266,6 +266,24 @@ class PETMeshCoupling(torch.nn.Module):
         return self.mesh_gate * c.up(m[:, None], rel, w)[:, 0]
 
 
+def les_damp_screen_factor(d: torch.Tensor, ds: torch.Tensor) -> torch.Tensor:
+    """``F(r) = (1 - w exp(-(r / a)^4)) (1 - s + s exp(-kappa r))`` for ``ds = (w, a_raw, s,
+    kappa_raw)``, ``a = softplus(a_raw)``, ``kappa = softplus(kappa_raw)``."""
+    w, a, s, k = ds[0], Fn.softplus(ds[1]), ds[2], Fn.softplus(ds[3])
+    x = d / a
+    return (1.0 - w * torch.exp(-(x * x) * (x * x))) * (1.0 + s * (torch.exp(-k * d) - 1.0))
+
+
+def les_energy_finite_ds(q: torch.Tensor, pos: torch.Tensor, sigma: float, ds: torch.Tensor) -> torch.Tensor:
+    """:func:`les_energy_finite` with the pair kernel times :func:`les_damp_screen_factor`."""
+    A = pos.shape[0]
+    rij = pos[:, None] - pos[None]
+    off = ~torch.eye(A, dtype=torch.bool, device=pos.device)
+    d = ((rij * rij).sum(-1) + (~off).to(pos.dtype)).sqrt()  # 1 on the diagonal
+    pair = torch.erf(d / (math.sqrt(2) * sigma)) / d * off.to(pos.dtype) * les_damp_screen_factor(d, ds)
+    return 0.5 * 14.399645 * (q * (pair @ q)).sum(-1)  # KE
+
+
 class PETLES(torch.nn.Module):
     """LES energy of ``num_charges`` latent charge channels from a PET-style head
     (node head plus cutoff-weighted edge head, summed over the readout layers).
@@ -284,6 +302,15 @@ class PETLES(torch.nn.Module):
     removed too, ``1/2 sum_i q_i sum_{j in nbrs(i)} q_j erf(r_ij / (sqrt 2 sigma)) / r_ij
     f_c(r_ij)`` with PET's cutoff function ``f_c``: LES then adds almost nothing
     inside the cutoff.
+
+    Damping and screening (``les_damp_screen``): the open-system pair kernel is multiplied by
+    ``F(r) = (1 - w exp(-(r / a)^4)) (1 - s + s exp(-kappa r))`` with learnable ``w``, ``s``
+    (both 0 at start, so ``F = 1`` and the energy is exactly the undamped one), ``a =
+    softplus(a_raw)`` (start 2.5 A) and ``kappa = softplus(kappa_raw)`` (start 0.2 / A).
+    ``w`` damps the short-range part (contact distances, where fixed charges overcount
+    the Coulomb interaction the backbone already describes), ``s`` blends in Yukawa
+    screening. Periodic structures are not supported with it (no screened Ewald sum yet):
+    they raise.
     """
 
     def __init__(
@@ -298,6 +325,7 @@ class PETLES(torch.nn.Module):
         total_charge_constraint: bool,
         tail_sigma: float = 0.0,
         tail_subtract_cutoff: bool = False,
+        damp_screen: bool = False,
     ) -> None:
         super().__init__()
 
@@ -326,6 +354,20 @@ class PETLES(torch.nn.Module):
         self.total_charge_constraint = total_charge_constraint
         self.les_gate = torch.nn.Parameter(torch.zeros(1))
         self.register_buffer("charge_unit", torch.ones(1))
+        self.damp_screen = bool(damp_screen)
+        if self.damp_screen:
+            if self.tail_subtract_cutoff:
+                raise ValueError("les_damp_screen with les_tail_subtract_cutoff is not supported")
+            # softplus^-1(x) = x + log(-expm1(-x))
+            inv = lambda x: x + math.log(-math.expm1(-x))  # noqa: E731
+            self.les_damp_w = torch.nn.Parameter(torch.zeros(1))
+            self.les_damp_a_raw = torch.nn.Parameter(torch.full((1,), inv(2.5)))
+            self.les_screen_s = torch.nn.Parameter(torch.zeros(1))
+            self.les_screen_kappa_raw = torch.nn.Parameter(torch.full((1,), inv(0.2)))
+
+    def damp_screen_params(self) -> torch.Tensor:
+        """``(w, a_raw, s, kappa_raw)`` stacked, the PLATO_LES_DS op's third input."""
+        return torch.cat([self.les_damp_w, self.les_damp_a_raw, self.les_screen_s, self.les_screen_kappa_raw])
 
     def charges(
         self,
@@ -380,7 +422,11 @@ class PETLES(torch.nn.Module):
             q_all = q_all.index_copy(0, idx, qs)
             pos = positions[idx]
             if _periodic(pbc[s]):
+                if self.damp_screen:
+                    raise ValueError("les_damp_screen: periodic structures are not supported")
                 es = les_energy_periodic(qs, pos, cells[s], sigma, self.kcut)
+            elif self.damp_screen:
+                es = les_energy_finite_ds(qs, pos, sigma, self.damp_screen_params())
             else:
                 es = les_energy_finite(qs, pos, sigma)
             e = e.index_copy(0, idx, es)
@@ -451,6 +497,7 @@ def apply_plato_lr(backend: torch.nn.Module, h: dict) -> None:
             bool(h.get("total_charge_constraint", False)),
             float(h.get("les_tail_sigma", 0.0) or 0.0),
             bool(h.get("les_tail_subtract_cutoff", False)),
+            bool(h.get("les_damp_screen", False)),
         )
     elif h.get("total_charge_constraint", False):
         raise ValueError("total_charge_constraint needs les: true")
