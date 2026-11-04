@@ -191,19 +191,46 @@ def soap_on_edges_from_reverse(p: torch.Tensor, reverse_neighbor_index: torch.Te
     return rep[reverse_neighbor_index.reshape(-1)].reshape(n_atoms, n_nbr, p.shape[1])
 
 
+class ZeroInitMLP(torch.nn.Module):
+    """LayerNorm(d_in) -> [Linear, SiLU] x n_hidden -> Linear(d_out) with the last layer zero:
+    exactly 0 at init, so a branch built on it starts at the pretrained model and grows only
+    as the gradient finds it useful (the SOAP-PET "branch init" for every arm; gate fixed at 1)."""
+
+    def __init__(self, d_in: int, d_out: int, hidden: int = 128, n_hidden: int = 2) -> None:
+        super().__init__()
+        layers: List[torch.nn.Module] = [torch.nn.LayerNorm(d_in)]
+        d = d_in
+        for _ in range(n_hidden):
+            layers += [torch.nn.Linear(d, hidden), torch.nn.SiLU()]
+            d = hidden
+        last = torch.nn.Linear(d, d_out)
+        torch.nn.init.zeros_(last.weight)
+        torch.nn.init.zeros_(last.bias)
+        self.net = torch.nn.Sequential(*layers, last)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class PETSoapHead(torch.nn.Module):
     """SOAP-PET variant 3: an additive SOAP-BPNN atomic energy, gate * MLP([sqrt(D) p_i, e(Z_i)]),
     the gate a scalar starting at 0 (the model starts as the pretrained PET). The unit p is
     scaled by sqrt(D) so its components are O(1) for the default-init first Linear (unit p:
     the head is ~ a per-species constant, within-species spread 0.3 meV/atom at gate 1)."""
 
-    def __init__(self, soap_dim: int, n_species: int, hidden: int = 128, n_center: int = 8) -> None:
+    def __init__(self, soap_dim: int, n_species: int, hidden: int = 128, n_center: int = 8,
+                 init: str = "gate") -> None:
         super().__init__()
+        if init not in ("gate", "zero_last"):
+            raise ValueError(f"head_init must be gate or zero_last, not {init}")
         self.center_embedding = torch.nn.Embedding(n_species, n_center)
-        self.mlp = torch.nn.Sequential(
-            torch.nn.Linear(soap_dim + n_center, hidden), torch.nn.SiLU(),
-            torch.nn.Linear(hidden, hidden), torch.nn.SiLU(), torch.nn.Linear(hidden, 1))
-        self.head_gate = torch.nn.Parameter(torch.zeros(1))
+        if init == "zero_last":  # ZeroInitMLP: exactly 0 at init, gate 1 (hold it with lr 0)
+            self.mlp = ZeroInitMLP(soap_dim + n_center, 1, hidden)
+        else:  # random head behind a zero gate
+            self.mlp = torch.nn.Sequential(
+                torch.nn.Linear(soap_dim + n_center, hidden), torch.nn.SiLU(),
+                torch.nn.Linear(hidden, hidden), torch.nn.SiLU(), torch.nn.Linear(hidden, 1))
+        self.head_gate = torch.nn.Parameter(torch.full((1,), 1.0 if init == "zero_last" else 0.0))
         self.input_scale = math.sqrt(soap_dim)
 
     def forward(self, p: torch.Tensor, center_species: torch.Tensor) -> torch.Tensor:
@@ -221,4 +248,5 @@ def apply_soap(backend: torch.nn.Module, h: dict) -> None:
                                      int(h.get("n_max", 6)), int(h.get("n_embed", 4)),
                                      str(h.get("normalize", "unit")))
     if h.get("head", False):
-        backend.soap_head = PETSoapHead(backend.soap.out_dim, n_species, int(h.get("head_hidden", 128)))
+        backend.soap_head = PETSoapHead(backend.soap.out_dim, n_species, int(h.get("head_hidden", 128)),
+                                        init=str(h.get("head_init", "gate")))

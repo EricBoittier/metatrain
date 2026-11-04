@@ -215,7 +215,8 @@ class PlatoLRHypers(TypedDict):
     """SOAP-PET (``modules/soap.py``): ``None`` (off) or a dict with the power spectrum
     (``cutoff`` 5.0, ``l_max`` 4, ``n_max`` 6, ``n_embed`` 4) and the variants on it, each
     behind a zero gate: ``head`` (an additive SOAP-BPNN atomic energy, ``head_hidden``
-    128)."""
+    128; ``head_init`` ``gate``: a random head behind a zero gate, or ``zero_last``: LayerNorm ->
+    MLP with a zero last layer, gate 1), ``normalize`` (``unit`` / ``sqrtD`` / ``none``)."""
     seed: int = 0
     """Seed of the RoPE directions."""
 
