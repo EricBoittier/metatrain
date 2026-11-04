@@ -1,0 +1,146 @@
+"""SOAP power spectrum on PET's padded neighbour tensors (SOAP-PET).
+
+``SoapPowerSpectrum`` computes, per atom, a rotation-invariant SOAP power spectrum from
+the same ``(n_atoms, max_neighbors)`` edge layout PET uses (no separate neighbour list):
+
+- neighbour density channels ``a = (n, k)``: Gaussian radial functions ``g_n(r)`` times a
+  cosine cutoff, times a learnable species embedding ``e_k(Z_j)``;
+- spherical expansion ``c_{a,lm} = sum_j g_n(r_ij) f_c(r_ij) e_k(Z_j) Y_lm(r_ij / r_ij)``,
+  real spherical harmonics up to ``l_max = 4`` as explicit polynomials;
+- power spectrum ``p_{ab,l} = (2l+1)^{-1/2} sum_m c_{a,lm} c_{b,lm}``, upper triangle
+  ``a <= b`` per ``l``, then normalised to unit length per atom.
+
+Only plain torch ops (mul / add / bmm / index_select / sqrt / cos), so the mlip.cpp
+GGUF exporter traces it into an ordinary GIR graph. The output dimension is
+``out_dim = (l_max + 1) * C (C + 1) / 2`` with ``C = n_max * n_embed`` (1500 for the
+defaults).
+
+``soap_on_edges(p, neighbor_index)`` gathers ``p_j`` onto the edge slots;
+``soap_on_edges_from_reverse(p, reverse_neighbor_index)`` does the same from PET's
+reversed-neighbour index (no neighbour-atom index needed, as in the exported graph).
+"""
+
+import math
+from typing import List
+
+import torch
+
+
+def _real_sh(u: torch.Tensor, l_max: int) -> List[torch.Tensor]:
+    """Orthonormal real spherical harmonics of unit vectors ``u`` (..., 3), one tensor
+    (..., 2l+1) per l <= l_max (l_max <= 4), m = -l..l."""
+    x, y, z = u[..., 0], u[..., 1], u[..., 2]
+    out = [torch.full_like(x, 0.28209479177387814)[..., None]]
+    if l_max >= 1:
+        c = 0.4886025119029199
+        out.append(torch.stack([c * y, c * z, c * x], -1))
+    if l_max >= 2:
+        xx, yy, zz = x * x, y * y, z * z
+        out.append(torch.stack([
+            1.0925484305920792 * x * y,
+            1.0925484305920792 * y * z,
+            0.31539156525252005 * (3.0 * zz - 1.0),
+            1.0925484305920792 * x * z,
+            0.5462742152960396 * (xx - yy),
+        ], -1))
+    if l_max >= 3:
+        out.append(torch.stack([
+            0.5900435899266435 * y * (3.0 * xx - yy),
+            2.890611442640554 * x * y * z,
+            0.4570457994644658 * y * (5.0 * zz - 1.0),
+            0.3731763325901154 * z * (5.0 * zz - 3.0),
+            0.4570457994644658 * x * (5.0 * zz - 1.0),
+            1.445305721320277 * z * (xx - yy),
+            0.5900435899266435 * x * (xx - 3.0 * yy),
+        ], -1))
+    if l_max >= 4:
+        out.append(torch.stack([
+            2.5033429417967046 * x * y * (xx - yy),
+            1.7701307697799304 * y * z * (3.0 * xx - yy),
+            0.9461746957575601 * x * y * (7.0 * zz - 1.0),
+            0.6690465435572892 * y * z * (7.0 * zz - 3.0),
+            0.10578554691520431 * (35.0 * zz * zz - 30.0 * zz + 3.0),
+            0.6690465435572892 * x * z * (7.0 * zz - 3.0),
+            0.47308734787878004 * (xx - yy) * (7.0 * zz - 1.0),
+            1.7701307697799304 * x * z * (xx - 3.0 * yy),
+            0.6258357354491761 * (xx * (xx - 3.0 * yy) - yy * (3.0 * xx - yy)),
+        ], -1))
+    if l_max > 4:
+        raise ValueError("SoapPowerSpectrum supports l_max <= 4")
+    return out
+
+
+class SoapPowerSpectrum(torch.nn.Module):
+    """Per-atom SOAP power spectrum from PET's padded neighbour tensors.
+
+    :param cutoff: radial cutoff (Å); a cosine cutoff takes the density to 0 there.
+    :param n_species: number of species indices (PET's ``element_indices``).
+    :param l_max: maximum angular order (<= 4).
+    :param n_max: number of Gaussian radial functions.
+    :param n_embed: species embedding channels (learnable).
+    """
+
+    def __init__(self, cutoff: float, n_species: int, l_max: int = 4, n_max: int = 6,
+                 n_embed: int = 4) -> None:
+        super().__init__()
+        self.cutoff = float(cutoff)
+        self.l_max = int(l_max)
+        self.n_max = int(n_max)
+        self.n_embed = int(n_embed)
+        self.species_embedding = torch.nn.Embedding(n_species, n_embed)
+        with torch.no_grad():  # O(1) channel weights, every species distinct
+            self.species_embedding.weight.normal_(0.0, 1.0)
+        self.register_buffer("centers", torch.linspace(0.0, self.cutoff, self.n_max))
+        self.width = self.cutoff / self.n_max
+        C = self.n_max * self.n_embed
+        iu = torch.triu_indices(C, C)
+        self.register_buffer("triu", (iu[0] * C + iu[1]).to(torch.long))
+        self.n_channels = C
+        self.out_dim = (self.l_max + 1) * int(self.triu.numel())
+
+    def forward(self, edge_vectors: torch.Tensor, padding_mask: torch.Tensor,
+                neighbor_species: torch.Tensor, center_species: torch.Tensor) -> torch.Tensor:
+        """
+        :param edge_vectors: (n_atoms, n_nbr, 3) r_j - r_i.
+        :param padding_mask: (n_atoms, n_nbr), True = padded slot.
+        :param neighbor_species: (n_atoms, n_nbr) species index of the neighbour.
+        :param center_species: (n_atoms,) species index of the centre (unused: the
+            power spectrum is centre-agnostic; consumers condition on it).
+        :return: (n_atoms, out_dim) unit-normalised power spectrum.
+        """
+        n_atoms, n_nbr = edge_vectors.shape[0], edge_vectors.shape[1]
+        r = torch.sqrt((edge_vectors * edge_vectors).sum(-1) + 1e-12)  # (n, m)
+        u = edge_vectors / r[..., None]
+        x = torch.clamp(r / self.cutoff, 0.0, 1.0)
+        fc = 0.5 * (1.0 + torch.cos(math.pi * x))
+        fc = torch.where(padding_mask, torch.zeros_like(fc), fc)
+        d = (r[..., None] - self.centers) / self.width
+        g = torch.exp(-0.5 * d * d) * fc[..., None]  # (n, m, n_max)
+        e = self.species_embedding(neighbor_species)  # (n, m, n_embed)
+        a = (g[..., :, None] * e[..., None, :]).reshape(n_atoms, n_nbr, self.n_channels)
+        at = a.transpose(1, 2)  # (n, C, m)
+        parts: List[torch.Tensor] = []
+        for l, Y in enumerate(_real_sh(u, self.l_max)):
+            c = torch.bmm(at, Y)  # (n, C, 2l+1)
+            p = torch.bmm(c, c.transpose(1, 2)) * (2 * l + 1) ** -0.5  # (n, C, C)
+            parts.append(torch.index_select(p.reshape(n_atoms, -1), 1, self.triu))
+        p = torch.cat(parts, -1)
+        return p / torch.sqrt((p * p).sum(-1, keepdim=True) + 1e-12)
+
+
+def soap_on_edges(p: torch.Tensor, neighbor_index: torch.Tensor) -> torch.Tensor:
+    """``p_j`` on every edge slot: p (n_atoms, D), neighbor_index (n_atoms, n_nbr) the
+    neighbour atom of each slot -> (n_atoms, n_nbr, D). Padded slots carry whatever atom
+    the index names; mask them with the padding mask."""
+    n_atoms, n_nbr = neighbor_index.shape[0], neighbor_index.shape[1]
+    return p[neighbor_index.reshape(-1)].reshape(n_atoms, n_nbr, p.shape[1])
+
+
+def soap_on_edges_from_reverse(p: torch.Tensor, reverse_neighbor_index: torch.Tensor,
+                               n_nbr: int) -> torch.Tensor:
+    """As :func:`soap_on_edges` from PET's flat reversed-neighbour index
+    (n_atoms * n_nbr,): slot (i, j)'s reverse slot belongs to atom j, so the per-slot
+    copy of p gathered by it is p_j. Plain expand / reshape / index ops (export-safe)."""
+    n_atoms = p.shape[0]
+    rep = p[:, None, :].expand(n_atoms, n_nbr, p.shape[1]).reshape(n_atoms * n_nbr, p.shape[1])
+    return rep[reverse_neighbor_index.reshape(-1)].reshape(n_atoms, n_nbr, p.shape[1])
