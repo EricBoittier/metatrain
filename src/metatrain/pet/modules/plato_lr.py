@@ -563,3 +563,103 @@ def apply_plato_lr(backend: torch.nn.Module, h: dict) -> None:
         )
     elif h.get("total_charge_constraint", False):
         raise ValueError("total_charge_constraint needs les: true")
+    if h.get("frag_charges", False):
+        if backend.system_conditioning is None or backend.les is None:
+            raise ValueError("frag_charges needs system_conditioning and les (for the energy unit)")
+        backend.frag = PETFragCharges(float(h.get("frag_R", 8.0)), float(h.get("frag_w", 2.0)), float(h.get("frag_tau", 0.1)),
+                                      float(h.get("frag_sigma", 4.0)), float(h.get("frag_t", 0.5)), float(h.get("frag_scale", 1.0)))
+
+
+def _smootherstep(x: torch.Tensor) -> torch.Tensor:
+    """``6x^5 - 15x^4 + 10x^3`` on [0, 1] (C2: first and second derivatives vanish at both ends)."""
+    x = x.clamp(0.0, 1.0)
+    return x * x * x * (x * (6.0 * x - 15.0) + 10.0)
+
+
+class PETFragCharges(torch.nn.Module):
+    """Fragment-constrained charges (``frag_charges``): per-fragment charge conditioning of the backbone plus a
+    strictly beyond-cutoff Coulomb term between fixed fragment charges, with a smooth treatment of fragments that
+    merge or split.
+
+    Units are the connected components of a structure at ``R`` (atom pairs closer than ``R`` join; ``R`` is the
+    backbone's receptive field). Unit ``u`` carries the integer charge ``Q_u``, the sum of the per-atom
+    ``formal_charges`` given with the structure (system data); without them a structure is one unit with its
+    total charge, which is the plain model. Two units couple with ``c_uv = 1 - S((d_uv - R) / w)``: ``S`` is
+    the smootherstep, and ``d_uv`` is the soft-min (temperature ``tau``) of their atom-atom distances. So the
+    coupling is 1 when the units touch the cutoff (where they merge into one unit) and 0 beyond ``R + w``.
+    ``c_uu = 1``.
+
+    - Conditioning: atom i in unit u is conditioned on ``Q_eff = sum_v c_uv Q_v``, the charge embedding
+      interpolated linearly between integer rows, so the backbone sees each separated fragment's own charge and
+      the merged charge at contact, continuously in between. The spin is the system's.
+    - Charges: ``q_i = sum_v c_uv Q_v / N_v`` with ``N_v = sum_w c_vw n_w``, which is uniform per unit when
+      separated and uniform over the union when merged; the total is conserved.
+    - Energy: ``1/2 KE sum_{i != j} q_i q_j erf(r / (sqrt 2 sigma)) / r T(r)``, where ``T`` rises smoothly from 0
+      at ``R - t`` to 1 at ``R``, so the term is zero inside the receptive field. It has no free amplitude
+      (``scale`` is fixed, 1). Open structures only.
+    Limitation: the soft-min of a merged unit is not the combination of its parts' soft-mins, so a third unit
+    within ``R + w`` of a merging pair sees a small jump.
+    """
+
+    def __init__(self, R: float = 8.0, w: float = 2.0, tau: float = 0.1, sigma: float = 4.0, t: float = 0.5,
+                 scale: float = 1.0) -> None:
+        super().__init__()
+        self.R, self.w, self.tau, self.sigma, self.t, self.scale = float(R), float(w), float(tau), float(sigma), float(t), float(scale)
+
+    def units(self, pos: torch.Tensor, formal: Optional[torch.Tensor], Q: torch.Tensor):
+        """``(labels (n,), Q_u (U,), n_u (U,), C (U, U))`` for one structure."""
+        n = pos.shape[0]
+        if formal is None:
+            lab = torch.zeros(n, dtype=torch.long, device=pos.device)
+            return lab, Q.reshape(1).to(pos.dtype), torch.full((1,), float(n), dtype=pos.dtype, device=pos.device), \
+                torch.ones(1, 1, dtype=pos.dtype, device=pos.device)
+        with torch.no_grad():
+            adj = torch.cdist(pos, pos) < self.R
+            lab = torch.arange(n, device=pos.device)
+            for _ in range(n):  # label propagation: min label over neighbours
+                new = torch.where(adj, lab[None, :], n).min(1).values
+                new = torch.minimum(new, lab)
+                if torch.equal(new, lab):
+                    break
+                lab = new
+            _, lab = torch.unique(lab, return_inverse=True)
+        U = int(lab.max()) + 1
+        oh = torch.nn.functional.one_hot(lab, U).to(pos.dtype)  # (n, U)
+        Qu = oh.T @ formal.to(pos.dtype); nu = oh.sum(0)
+        if U == 1:
+            return lab, Qu, nu, torch.ones(1, 1, dtype=pos.dtype, device=pos.device)
+        d = torch.sqrt(((pos[:, None] - pos[None]) ** 2).sum(-1) + 1e-12)
+        logm = torch.where(oh > 0, 0.0, float("-inf"))  # (n, U)
+        a = torch.logsumexp(-d[:, :, None] / self.tau + logm[None, :, :], dim=1)  # (n, U): over j in v
+        b = torch.logsumexp(a[:, None, :] + logm[:, :, None], dim=0)  # (U, U): over i in u
+        dsoft = -self.tau * b
+        C = 1.0 - _smootherstep((dsoft - self.R) / self.w)
+        C = torch.where(torch.eye(U, dtype=torch.bool, device=pos.device), torch.ones_like(C), C)
+        return lab, Qu, nu, C
+
+    def charges(self, lab, Qu, nu, C):
+        """``(Q_eff per atom, q per atom)``."""
+        Qeff = C @ Qu
+        Nv = C @ nu
+        qv = C @ (Qu / Nv)  # per unit u: sum_v c_uv Q_v / N_v
+        return Qeff[lab], qv[lab]
+
+    def energy(self, q: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """Per-atom energies (eV) of the beyond-``R`` Coulomb term."""
+        A = pos.shape[0]
+        off = ~torch.eye(A, dtype=torch.bool, device=pos.device)
+        d = torch.sqrt(((pos[:, None] - pos[None]) ** 2).sum(-1) + (~off).to(pos.dtype))
+        T = _smootherstep((d - (self.R - self.t)) / self.t)
+        k = torch.erf(d / (math.sqrt(2) * self.sigma)) / d * T * off.to(pos.dtype)
+        return self.scale * 0.5 * 14.399645 * q * (k @ q)
+
+    @staticmethod
+    def conditioning(sc: torch.nn.Module, qeff: torch.Tensor, spin: torch.Tensor) -> torch.Tensor:
+        """``SystemConditioningEmbedding`` evaluated per atom at the (possibly fractional) charge ``qeff``."""
+        x = (qeff + sc.max_charge).clamp(0.0, 2.0 * sc.max_charge)
+        f = x.detach().floor().clamp(max=2 * sc.max_charge - 1)
+        tt = (x - f)[:, None]
+        Ew = sc.charge_embedding.weight
+        c = (1 - tt) * Ew[f.long()] + tt * Ew[f.long() + 1]
+        s = sc.spin_multiplicity_embedding(spin - 1)
+        return sc.project(torch.cat([c, s], dim=-1))
