@@ -528,6 +528,7 @@ class PETBackend(torch.nn.Module):
                         self._neighbor_index(batch_data, padding_mask)
                         if self.les.tail_subtract_cutoff
                         else None,
+                        batch_data["element_indices_nodes"],
                     )[:, None]
                 )
 

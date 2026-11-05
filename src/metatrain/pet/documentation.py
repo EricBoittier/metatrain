@@ -216,6 +216,13 @@ class PlatoLRHypers(TypedDict):
     a)^4)) (1 - s + s exp(-kappa r))`` with learnable ``w``, ``s`` (start 0: the undamped
     energy exactly), ``a`` (start 2.5 A) and ``kappa`` (start 0.2 / A). Periodic structures
     raise."""
+    les_thole: bool = False
+    """With ``les_damp_screen``: the pair kernel also times the Thole damping ``1 - w_T (1 +
+    u/2) exp(-u)``, ``u = a_T r / (alpha_i alpha_j)^(1/6)`` (free-atom polarisabilities,
+    Schwerdtfeger & Nagle 2018), learnable ``w_T`` (start 0) and ``a_T`` (start
+    ``les_thole_a``)."""
+    les_thole_a: float = 0.39
+    """Start value of the Thole ``a_T``."""
     seed: int = 0
     """Seed of the RoPE directions."""
 
