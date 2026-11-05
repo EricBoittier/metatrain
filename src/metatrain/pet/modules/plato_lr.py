@@ -578,64 +578,65 @@ def _smootherstep(x: torch.Tensor) -> torch.Tensor:
 
 class PETFragCharges(torch.nn.Module):
     """Fragment-constrained charges (``frag_charges``): per-fragment charge conditioning of the backbone plus a
-    strictly beyond-cutoff Coulomb term between fixed fragment charges, with a smooth treatment of fragments that
-    merge or split.
+    strictly beyond-cutoff Coulomb term between fixed fragment charges.
 
-    Units are the connected components of a structure at ``R`` (atom pairs closer than ``R`` join; ``R`` is the
-    backbone's receptive field). Unit ``u`` carries the integer charge ``Q_u``, the sum of the per-atom
-    ``formal_charges`` given with the structure (system data); without them a structure is one unit with its
-    total charge, which is the plain model. Two units couple with ``c_uv = 1 - S((d_uv - R) / w)``: ``S`` is
-    the smootherstep, and ``d_uv`` is the soft-min (temperature ``tau``) of their atom-atom distances. So the
-    coupling is 1 when the units touch the cutoff (where they merge into one unit) and 0 beyond ``R + w``.
-    ``c_uu = 1``.
+    Units are the bonded fragments of a structure. Two atoms are bonded when closer than ``f (r_i + r_j)``, with
+    ``r`` the ASE covalent radii and ``f = 1.2`` (QCell / fragments.py), or ``f = 1.3`` when either atom is a
+    transition, lanthanide or post-transition metal (metal-ligand coordination, e.g. Zn-N 2.32 A). Alkali metals
+    (Li-Cs) never bond, so contact ion pairs stay two units. Units are the connected components. Unit ``u``
+    carries the integer charge ``Q_u``, the sum of the per-atom system data ``mtt::formal_charges``. Without that
+    data, a structure is one unit with its total charge: the plain model, identical to the base.
 
-    - Conditioning: atom i in unit u is conditioned on ``Q_eff = sum_v c_uv Q_v``, the charge embedding
-      interpolated linearly between integer rows, so the backbone sees each separated fragment's own charge and
-      the merged charge at contact, continuously in between. The spin is the system's.
-    - Charges: ``q_i = sum_v c_uv Q_v / N_v`` with ``N_v = sum_w c_vw n_w``, which is uniform per unit when
-      separated and uniform over the union when merged; the total is conserved.
+    - Conditioning: every atom is conditioned on its unit's charge (the system's spin), at every distance, so a
+      contact ion pair is +1/-1.
+    - Charges: ``Q_u / n_u`` on each atom of the unit.
     - Energy: ``1/2 KE sum_{i != j} q_i q_j erf(r / (sqrt 2 sigma)) / r T(r)``, where ``T`` rises smoothly from 0
-      at ``R - t`` to 1 at ``R``, so the term is zero inside the receptive field. It has no free amplitude
-      (``scale`` is fixed, 1). Open structures only.
-    Limitation: the soft-min of a merged unit is not the combination of its parts' soft-mins, so a third unit
-    within ``R + w`` of a merging pair sees a small jump.
+      at ``R - t`` to 1 at ``R``: zero inside the receptive field, no free amplitude. Open structures only.
+
+    Bond making and breaking change the units discontinuously; a fade for reactive dynamics is not implemented.
     """
 
     def __init__(self, R: float = 8.0, w: float = 2.0, tau: float = 0.1, sigma: float = 4.0, t: float = 0.5,
                  scale: float = 1.0) -> None:
         super().__init__()
         self.R, self.w, self.tau, self.sigma, self.t, self.scale = float(R), float(w), float(tau), float(sigma), float(t), float(scale)
+        from ase.data import covalent_radii
+        self.register_buffer("cov", torch.tensor(covalent_radii, dtype=torch.float64), persistent=False)
+        fac = torch.full((len(covalent_radii),), 1.2, dtype=torch.float64)
+        metal = list(range(21, 31)) + list(range(39, 49)) + list(range(57, 81)) + [13, 31, 49, 50, 81, 82, 83]
+        fac[metal] = 1.3
+        alk = torch.zeros(len(covalent_radii), dtype=torch.bool)
+        alk[[3, 11, 19, 37, 55, 87]] = True
+        self.register_buffer("fac", fac, persistent=False)
+        self.register_buffer("alkali", alk, persistent=False)
 
-    def units(self, pos: torch.Tensor, formal: Optional[torch.Tensor], Q: torch.Tensor):
-        """``(labels (n,), Q_u (U,), n_u (U,), C (U, U))`` for one structure."""
+    def bonded_units(self, z: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """Unit label per atom (0..U-1) by the bond rule above."""
+        n = pos.shape[0]
+        with torch.no_grad():
+            r = self.cov.to(pos.dtype)[z]; f = self.fac.to(pos.dtype)[z]; al = self.alkali[z]
+            thr = torch.maximum(f[:, None], f[None, :]) * (r[:, None] + r[None, :])
+            adj = (torch.cdist(pos.detach(), pos.detach()) < thr) & ~(al[:, None] | al[None, :])
+            lab = torch.arange(n, device=pos.device)
+            for _ in range(n):
+                new = torch.minimum(torch.where(adj, lab[None, :], n).min(1).values, lab)
+                if torch.equal(new, lab):
+                    break
+                lab = new
+            _, lab = torch.unique(lab, return_inverse=True)
+        return lab
+
+    def units(self, z: torch.Tensor, pos: torch.Tensor, formal: Optional[torch.Tensor], Q: torch.Tensor):
+        """``(labels (n,), Q_u (U,), n_u (U,), C (U, U) = identity)`` for one structure."""
         n = pos.shape[0]
         if formal is None:
             lab = torch.zeros(n, dtype=torch.long, device=pos.device)
             return lab, Q.reshape(1).to(pos.dtype), torch.full((1,), float(n), dtype=pos.dtype, device=pos.device), \
                 torch.ones(1, 1, dtype=pos.dtype, device=pos.device)
-        with torch.no_grad():
-            adj = torch.cdist(pos, pos) < self.R
-            lab = torch.arange(n, device=pos.device)
-            for _ in range(n):  # label propagation: min label over neighbours
-                new = torch.where(adj, lab[None, :], n).min(1).values
-                new = torch.minimum(new, lab)
-                if torch.equal(new, lab):
-                    break
-                lab = new
-            _, lab = torch.unique(lab, return_inverse=True)
+        lab = self.bonded_units(z, pos)
         U = int(lab.max()) + 1
-        oh = torch.nn.functional.one_hot(lab, U).to(pos.dtype)  # (n, U)
-        Qu = oh.T @ formal.to(pos.dtype); nu = oh.sum(0)
-        if U == 1:
-            return lab, Qu, nu, torch.ones(1, 1, dtype=pos.dtype, device=pos.device)
-        d = torch.sqrt(((pos[:, None] - pos[None]) ** 2).sum(-1) + 1e-12)
-        logm = torch.where(oh > 0, 0.0, float("-inf"))  # (n, U)
-        a = torch.logsumexp(-d[:, :, None] / self.tau + logm[None, :, :], dim=1)  # (n, U): over j in v
-        b = torch.logsumexp(a[:, None, :] + logm[:, :, None], dim=0)  # (U, U): over i in u
-        dsoft = -self.tau * b
-        C = 1.0 - _smootherstep((dsoft - self.R) / self.w)
-        C = torch.where(torch.eye(U, dtype=torch.bool, device=pos.device), torch.ones_like(C), C)
-        return lab, Qu, nu, C
+        oh = torch.nn.functional.one_hot(lab, U).to(pos.dtype)
+        return lab, oh.T @ formal.to(pos.dtype), oh.sum(0), torch.eye(U, dtype=pos.dtype, device=pos.device)
 
     def charges(self, lab, Qu, nu, C):
         """``(Q_eff per atom, q per atom)``."""

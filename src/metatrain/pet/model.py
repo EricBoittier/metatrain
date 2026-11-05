@@ -495,7 +495,7 @@ class PET(ModelInterface[ModelHypers]):
                         formal: Optional[torch.Tensor] = None
                         if "mtt::formal_charges" in system.known_data():
                             formal = system.get_data("mtt::formal_charges").block().values.reshape(-1).to(pos.dtype)
-                        lab, Qu, nu, C = frag.units(pos, formal, charges[k])
+                        lab, Qu, nu, C = frag.units(system.types.to(torch.long), pos, formal, charges[k])
                         qeff, q = frag.charges(lab, Qu, nu, C)
                         qeff_l.append(qeff)
                         if bool(system.pbc.any()):
