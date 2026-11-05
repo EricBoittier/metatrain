@@ -585,7 +585,8 @@ class PETFragCharges(torch.nn.Module):
     transition, lanthanide or post-transition metal (metal-ligand coordination, e.g. Zn-N 2.32 A). Alkali metals
     (Li-Cs) never bond, so contact ion pairs stay two units. Units are the connected components. Unit ``u``
     carries the integer charge ``Q_u``, the sum of the per-atom system data ``mtt::formal_charges``. Without that
-    data, a structure is one unit with its total charge: the plain model, identical to the base.
+    data (and for periodic structures), a structure is one unit with its total charge and no Coulomb term: the plain
+    model, identical to the base.
 
     - Conditioning: every atom is conditioned on its unit's charge (the system's spin), at every distance, so a
       contact ion pair is +1/-1.

@@ -493,13 +493,15 @@ class PET(ModelInterface[ModelHypers]):
                         idx = torch.nonzero(system_indices == k).flatten()
                         pos = positions[idx]
                         formal: Optional[torch.Tensor] = None
-                        if "mtt::formal_charges" in system.known_data():
+                        periodic = bool(system.pbc.any())
+                        if "mtt::formal_charges" in system.known_data() and not periodic:
                             formal = system.get_data("mtt::formal_charges").block().values.reshape(-1).to(pos.dtype)
                         lab, Qu, nu, C = frag.units(system.types.to(torch.long), pos, formal, charges[k])
                         qeff, q = frag.charges(lab, Qu, nu, C)
                         qeff_l.append(qeff)
-                        if bool(system.pbc.any()):
-                            e_l.append(torch.zeros_like(q))  # open structures only
+                        if periodic or formal is None:
+                            # open structures with formal charges only: otherwise the plain model
+                            e_l.append(torch.zeros_like(q))
                         else:
                             e_l.append(frag.energy(q, pos))
                     batch_data["frag_qeff"] = torch.cat(qeff_l)
