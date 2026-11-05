@@ -266,6 +266,57 @@ class PETMeshCoupling(torch.nn.Module):
         return self.mesh_gate * c.up(m[:, None], rel, w)[:, 0]
 
 
+def les_damp_screen_factor(d: torch.Tensor, ds: torch.Tensor) -> torch.Tensor:
+    """``F(r) = (1 - w exp(-(r / a)^4)) (1 - s + s exp(-kappa r))`` for ``ds = (w, a_raw, s,
+    kappa_raw)``, ``a = softplus(a_raw)``, ``kappa = softplus(kappa_raw)``."""
+    w, a, s, k = ds[0], Fn.softplus(ds[1]), ds[2], Fn.softplus(ds[3])
+    x = d / a
+    return (1.0 - w * torch.exp(-(x * x) * (x * x))) * (1.0 + s * (torch.exp(-k * d) - 1.0))
+
+
+# Free-atom static dipole polarisabilities (bohr^3), Schwerdtfeger & Nagle, "2018 Table of static
+# dipole polarizabilities of the neutral elements in the periodic table", Mol. Phys. 117, 1200 (2019)
+# (as tabulated by mendeleev 1.3.0, `dipole_polarizability`), Z = 1..103.
+FREE_ATOM_ALPHA_BOHR3 = [
+    4.50711, 1.38375, 164.113, 37.74, 20.5, 11.3, 7.4, 5.3, 3.74, 2.6611, 162.7, 71.2, 57.8, 37.3, 25, 19.4,
+    14.6, 11.083, 289.7, 160.8, 97, 87, 87, 83, 68, 62, 55, 49, 46.5, 38.67, 50, 40, 30, 28.9, 21, 16.78,
+    319.8, 197.2, 162, 112, 98, 87, 79, 72, 66, 26.14, 55, 46, 65, 53, 43, 38, 32.9, 27.32, 400.9, 272,
+    215, 205, 216, 208, 200, 192, 184, 158, 170, 163, 165, 150, 144, 139, 137, 103, 74, 68, 62, 57, 54,
+    48, 36, 33.91, 50, 47, 48, 44, 42, 35, 317.8, 246, 203, 217, 154, 129, 151, 132, 131, 144, 125, 122,
+    118, 113, 109, 110, 320,
+]
+BOHR3_TO_A3 = 0.529177210903**3
+
+
+def thole_inv_alpha16(atomic_types: List[int]) -> torch.Tensor:
+    """``alpha_Z^(-1/6)`` (A^-1/2) per species index, the free-atom polarisabilities in A^3."""
+    return torch.tensor([(FREE_ATOM_ALPHA_BOHR3[int(z) - 1] * BOHR3_TO_A3) ** (-1.0 / 6.0) for z in atomic_types])
+
+
+def les_thole_factor(d: torch.Tensor, wt: torch.Tensor, at_raw: torch.Tensor, ia: torch.Tensor) -> torch.Tensor:
+    """Thole charge-charge damping ``1 - w_T (1 + u/2) exp(-u)``, ``u = a_T r / (alpha_i alpha_j)^(1/6)``,
+    ``a_T = softplus(at_raw)``, ``ia = alpha^(-1/6)`` per atom."""
+    u = Fn.softplus(at_raw) * d * (ia[:, None] * ia[None, :])
+    return 1.0 - wt * (1.0 + 0.5 * u) * torch.exp(-u)
+
+
+def les_energy_finite_ds(q: torch.Tensor, pos: torch.Tensor, sigma: float, ds: torch.Tensor,
+                         ia: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """:func:`les_energy_finite` with the pair kernel times :func:`les_damp_screen_factor`
+    (``ds[:4]``), and with ``ds = (w, a_raw, s, kappa_raw, w_T, a_T_raw)`` and the per-atom
+    ``ia = alpha^(-1/6)`` times :func:`les_thole_factor` too."""
+    A = pos.shape[0]
+    rij = pos[:, None] - pos[None]
+    off = ~torch.eye(A, dtype=torch.bool, device=pos.device)
+    d = ((rij * rij).sum(-1) + (~off).to(pos.dtype)).sqrt()  # 1 on the diagonal
+    pair = torch.erf(d / (math.sqrt(2) * sigma)) / d * off.to(pos.dtype) * les_damp_screen_factor(d, ds)
+    if ds.shape[0] == 6:
+        if ia is None:
+            raise ValueError("les_thole needs the per-atom polarisabilities")
+        pair = pair * les_thole_factor(d, ds[4], ds[5], ia.to(pos.dtype))
+    return 0.5 * 14.399645 * (q * (pair @ q)).sum(-1)  # KE
+
+
 class PETLES(torch.nn.Module):
     """LES energy of ``num_charges`` latent charge channels from a PET-style head
     (node head plus cutoff-weighted edge head, summed over the readout layers).
@@ -284,6 +335,20 @@ class PETLES(torch.nn.Module):
     removed too, ``1/2 sum_i q_i sum_{j in nbrs(i)} q_j erf(r_ij / (sqrt 2 sigma)) / r_ij
     f_c(r_ij)`` with PET's cutoff function ``f_c``: LES then adds almost nothing
     inside the cutoff.
+
+    Damping and screening (``les_damp_screen``): the open-system pair kernel is multiplied by
+    ``F(r) = (1 - w exp(-(r / a)^4)) (1 - s + s exp(-kappa r))`` with learnable ``w``, ``s``
+    (both 0 at start, so ``F = 1`` and the energy is exactly the undamped one), ``a =
+    softplus(a_raw)`` (start 2.5 A) and ``kappa = softplus(kappa_raw)`` (start 0.2 / A).
+    ``w`` damps the short-range part (contact distances, where fixed charges overcount
+    the Coulomb interaction the backbone already describes), ``s`` blends in Yukawa
+    screening. Periodic structures are not supported with it (no screened Ewald sum yet):
+    they raise.
+
+    Thole damping (``les_thole``, with ``les_damp_screen``): the kernel also times ``1 - w_T
+    (1 + u/2) exp(-u)``, ``u = a_T r / (alpha_i alpha_j)^(1/6)``, free-atom polarisabilities
+    ``alpha`` (fixed, :data:`FREE_ATOM_ALPHA_BOHR3`), learnable ``w_T`` (start 0) and ``a_T =
+    softplus(a_T_raw)`` (start ``les_thole_a``).
     """
 
     def __init__(
@@ -298,6 +363,10 @@ class PETLES(torch.nn.Module):
         total_charge_constraint: bool,
         tail_sigma: float = 0.0,
         tail_subtract_cutoff: bool = False,
+        damp_screen: bool = False,
+        thole: bool = False,
+        thole_a: float = 0.39,
+        atomic_types: Optional[List[int]] = None,
     ) -> None:
         super().__init__()
 
@@ -326,6 +395,30 @@ class PETLES(torch.nn.Module):
         self.total_charge_constraint = total_charge_constraint
         self.les_gate = torch.nn.Parameter(torch.zeros(1))
         self.register_buffer("charge_unit", torch.ones(1))
+        self.damp_screen = bool(damp_screen)
+        if self.damp_screen:
+            if self.tail_subtract_cutoff:
+                raise ValueError("les_damp_screen with les_tail_subtract_cutoff is not supported")
+            # softplus^-1(x) = x + log(-expm1(-x))
+            inv = lambda x: x + math.log(-math.expm1(-x))  # noqa: E731
+            self.les_damp_w = torch.nn.Parameter(torch.zeros(1))
+            self.les_damp_a_raw = torch.nn.Parameter(torch.full((1,), inv(2.5)))
+            self.les_screen_s = torch.nn.Parameter(torch.zeros(1))
+            self.les_screen_kappa_raw = torch.nn.Parameter(torch.full((1,), inv(0.2)))
+        self.thole = bool(thole)
+        if self.thole:
+            if not self.damp_screen or atomic_types is None:
+                raise ValueError("les_thole needs les_damp_screen and the atomic types")
+            self.les_thole_w = torch.nn.Parameter(torch.zeros(1))
+            self.les_thole_a_raw = torch.nn.Parameter(torch.full((1,), inv(float(thole_a))))
+            self.register_buffer("les_thole_ia", thole_inv_alpha16(atomic_types))
+
+    def damp_screen_params(self) -> torch.Tensor:
+        """``(w, a_raw, s, kappa_raw[, w_T, a_T_raw])`` stacked, the PLATO_LES_DS op's third input."""
+        p = [self.les_damp_w, self.les_damp_a_raw, self.les_screen_s, self.les_screen_kappa_raw]
+        if self.thole:
+            p += [self.les_thole_w, self.les_thole_a_raw]
+        return torch.cat(p)
 
     def charges(
         self,
@@ -357,16 +450,22 @@ class PETLES(torch.nn.Module):
         total_charge: Optional[torch.Tensor],
         edge_distances: Optional[torch.Tensor] = None,
         neighbor_index: Optional[torch.Tensor] = None,
+        species: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Gated per-atom LES energies ``(A,)`` in model units; ``edge_distances`` and
         ``neighbor_index`` (NEF, the neighbour atom of each slot) for the cutoff
-        subtraction of the LES tail."""
+        subtraction of the LES tail; ``species`` (species indices) for the Thole damping."""
         q = self.charges(
             node_features_list, edge_features_list, padding_mask, cutoff_factors
         )
         sigma = self.tail_sigma if self.tail_sigma > 0 else self.sigma
         e = torch.zeros_like(q[:, 0])
         q_all = torch.zeros_like(q)
+        ia_all: Optional[torch.Tensor] = None
+        if self.thole:
+            if species is None:
+                raise ValueError("les_thole needs the species")
+            ia_all = self.les_thole_ia[species]
         for s in range(cells.shape[0]):
             idx = _system_atoms(system_indices, s)
             qs = q[idx]
@@ -380,7 +479,12 @@ class PETLES(torch.nn.Module):
             q_all = q_all.index_copy(0, idx, qs)
             pos = positions[idx]
             if _periodic(pbc[s]):
+                if self.damp_screen:
+                    raise ValueError("les_damp_screen: periodic structures are not supported")
                 es = les_energy_periodic(qs, pos, cells[s], sigma, self.kcut)
+            elif self.damp_screen:
+                es = les_energy_finite_ds(qs, pos, sigma, self.damp_screen_params(),
+                                          None if ia_all is None else ia_all[idx])
             else:
                 es = les_energy_finite(qs, pos, sigma)
             e = e.index_copy(0, idx, es)
@@ -451,6 +555,11 @@ def apply_plato_lr(backend: torch.nn.Module, h: dict) -> None:
             bool(h.get("total_charge_constraint", False)),
             float(h.get("les_tail_sigma", 0.0) or 0.0),
             bool(h.get("les_tail_subtract_cutoff", False)),
+            bool(h.get("les_damp_screen", False)),
+            bool(h.get("les_thole", False)),
+            float(h.get("les_thole_a", 0.39)),
+            [z for z, i in sorted(((z, int(i)) for z, i in enumerate(backend.species_to_species_index.tolist())
+                                   if int(i) >= 0), key=lambda t: t[1])],
         )
     elif h.get("total_charge_constraint", False):
         raise ValueError("total_charge_constraint needs les: true")
