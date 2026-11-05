@@ -291,3 +291,42 @@ def test_chunked_ewald_matches():
     model.les_chunk = 64  # far below this cell's atoms x k vectors
     for a, b in zip(energy_and_grads(), ref, strict=True):
         torch.testing.assert_close(a, b, rtol=1e-11, atol=1e-12)
+
+
+XI_SC = 2.837297479  # simple-cubic Madelung constant (point charge + neutralising background)
+
+
+@pytest.mark.parametrize("sigma", [0.5, 1.0, 2.0])
+@pytest.mark.parametrize("L", [10.0, 20.0, 40.0])
+def test_charged_cell_point_charge_convention(L, sigma):
+    """One charge Q in a cube: with the Gaussian background term the energy is the
+    point-charge Ewald value - KE xi Q^2 / (2 L) at every sigma (it used to carry an extra
+    + KE pi sigma^2 Q^2 / V: up to 0.18 eV for sigma 2 A, L 10 A), and the cell-size
+    derivative (the stress) is the point-charge one too."""
+    Q = 1.5
+    s = torch.tensor(1.0, dtype=torch.float64, requires_grad=True)
+    cell = torch.eye(3, dtype=torch.float64) * L * s
+    pos = torch.full((1, 3), 0.3 * L, dtype=torch.float64) * s
+    q = torch.tensor([[Q]], dtype=torch.float64)
+    e = les_energy_periodic(q, pos, cell, sigma, 6.0).sum()
+    ref = -KE * XI_SC * Q**2 / (2 * L)
+    assert abs(float(e.detach()) - ref) < 3e-6 * abs(ref)  # the kcut-6 window (as test_ewald_converged); erfc images at L 10, sigma 2
+    dE = float(torch.autograd.grad(e, s)[0])  # d/ds of -KE xi Q^2 / (2 L s) at s = 1
+    assert abs(dE - KE * XI_SC * Q**2 / (2 * L)) < 1e-4 * abs(ref)  # 3e-5 at L 10, sigma 2: image overlap
+
+
+def test_charged_cell_batched_matches():
+    """The batched sum (padded slots, zero charge) gives the same charged-cell energy as
+    :func:`les_energy_periodic`, background term included, spread over the real atoms."""
+    from metatrain.experimental.plato_pet_lr.modules.ewald import les_energy_periodic_batched
+    g = torch.Generator().manual_seed(1)
+    L, sigma = 9.0, 1.5
+    cell = torch.eye(3, dtype=torch.float64) * L
+    pos = torch.rand(5, 3, generator=g, dtype=torch.float64) * L
+    q = torch.randn(5, 1, generator=g, dtype=torch.float64) + 0.4  # total charge != 0
+    e1 = les_energy_periodic(q, pos, cell, sigma, 6.0)
+    qp = torch.cat([q, torch.zeros(2, 1, dtype=torch.float64)])[None]
+    pp = torch.cat([pos, torch.zeros(2, 3, dtype=torch.float64)])[None]
+    n = kvectors(cell, 6.0 / sigma).to(torch.float64)
+    e2 = les_energy_periodic_batched(qp, pp, cell[None], None, n, sigma, 6.0)[0]
+    assert torch.allclose(e2[:5], e1, atol=1e-10) and float(e2[5:].abs().max()) == 0.0

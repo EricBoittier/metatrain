@@ -416,7 +416,7 @@ class PETLES(torch.nn.Module):
     def damp_screen_params(self) -> torch.Tensor:
         """``(w, a_raw, s, kappa_raw[, w_T, a_T_raw])`` stacked, the PLATO_LES_DS op's third input."""
         p = [self.les_damp_w, self.les_damp_a_raw, self.les_screen_s, self.les_screen_kappa_raw]
-        if self.thole:
+        if getattr(self, "thole", False):  # (modules pickled before les_thole lack it)
             p += [self.les_thole_w, self.les_thole_a_raw]
         return torch.cat(p)
 
@@ -462,7 +462,7 @@ class PETLES(torch.nn.Module):
         e = torch.zeros_like(q[:, 0])
         q_all = torch.zeros_like(q)
         ia_all: Optional[torch.Tensor] = None
-        if self.thole:
+        if getattr(self, "thole", False):
             if species is None:
                 raise ValueError("les_thole needs the species")
             ia_all = self.les_thole_ia[species]

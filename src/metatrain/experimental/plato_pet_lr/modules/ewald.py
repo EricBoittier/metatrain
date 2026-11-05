@@ -54,7 +54,15 @@ def window(k: torch.Tensor, kcut: float, width: float) -> torch.Tensor:
 def les_energy_periodic(
     q: torch.Tensor, pos: torch.Tensor, cell: torch.Tensor, sigma: float, kcut: float
 ) -> torch.Tensor:
-    """Per-atom energies, ``q`` is ``(atoms, channels)`` and neutral per channel."""
+    """Per-atom energies, ``q`` is ``(atoms, channels)``.
+
+    Reciprocal sum without k = 0 (tinfoil boundary, neutralising background) minus the
+    Gaussian self energies. A charged cell (total ``Q_c = sum_i q_ic != 0``, e.g. with a
+    total-charge constraint) also gets the Gaussian charges' background term ``- pi
+    sigma^2 sum_c Q_c^2 / V`` (:func:`charged_background`, spread evenly over the atoms):
+    without it the energy carries a constant ``+ pi sigma^2 Q^2 / V`` that depends on the
+    Gaussian width and the volume (and so enters the stress). With it, a charged cell gets
+    the point-charge Ewald convention, ``- xi Q^2 / (2 L)`` for one charge in a cube."""
     kc = kcut / sigma
     n = kvectors(cell, kc)
     k = 2 * math.pi * n @ torch.linalg.inv(cell).T
@@ -67,7 +75,17 @@ def les_energy_periodic(
     # half space: 2 pi / V over all k  ->  4 pi / V over k > 0
     e = 4 * math.pi / V * (q * ((c @ (C * g).T) + (s @ (S * g).T))).sum(-1)
     self_e = (q * q).sum(-1) / (math.sqrt(2 * math.pi) * sigma)
-    return 14.399645 * (e - self_e)  # KE
+    bg = charged_background(q.sum(0), V, sigma) / q.shape[0]
+    return 14.399645 * (e - self_e - bg)  # KE
+
+
+def charged_background(Q: torch.Tensor, V: torch.Tensor, sigma: float) -> torch.Tensor:
+    """``pi sigma^2 sum_c Q_c^2 / V`` for the cell's total charges ``Q`` ``(..., channels)`` and
+    volumes ``V`` ``(...)``: the energy (in units of KE) by which the k != 0 Ewald sum of
+    Gaussian charges of width ``sigma`` with a neutralising background exceeds the
+    point-charge convention (the k -> 0 limit of ``exp(-sigma^2 k^2 / 2) / k^2 - 1 / k^2``
+    times ``2 pi Q^2 / V``). Zero for neutral cells."""
+    return math.pi * sigma**2 * (Q * Q).sum(-1) / V
 
 
 def les_energy_finite(q: torch.Tensor, pos: torch.Tensor, sigma: float) -> torch.Tensor:
@@ -209,7 +227,7 @@ def les_energy_periodic_batched(
 ) -> torch.Tensor:
     """:func:`les_energy_periodic` of ``S`` structures padded to ``P`` atoms.
 
-    ``q`` ``(S, P, channels)`` (zero on padded slots, neutral per structure),
+    ``q`` ``(S, P, channels)`` (zero on padded slots),
     ``pos`` ``(S, P, 3)``, ``cells`` ``(U, 3, 3)`` as in
     :meth:`MeshCoupling.mesh_batched`, ``n`` a superset of every cell's k-set
     (:func:`kset_host`); terms outside a structure's own set get weight exactly 0.
@@ -233,7 +251,11 @@ def les_energy_periodic_batched(
     else:
         e = _reciprocal(q, pos, k, g, V)
     self_e = (q * q).sum(-1) / (math.sqrt(2 * math.pi) * sigma)
-    return 14.399645 * (e - self_e)  # KE
+    # charged cells: the background term of :func:`les_energy_periodic`, spread over the
+    # structure's atoms (slots with any nonzero charge; padded slots are zero)
+    atom = (q != 0).any(-1).to(q.dtype)  # (S, P)
+    bg = charged_background(q.sum(1), V, sigma) / atom.sum(1).clamp_min(1.0)  # (S,)
+    return 14.399645 * (e - self_e - bg[:, None] * atom)  # KE
 
 
 def les_energy_finite_batched(
