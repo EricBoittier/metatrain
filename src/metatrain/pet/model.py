@@ -506,6 +506,25 @@ class PET(ModelInterface[ModelHypers]):
                             e_l.append(frag.energy(q, pos))
                     batch_data["frag_qeff"] = torch.cat(qeff_l)
                     batch_data["frag_e"] = torch.cat(e_l)
+                sqe = getattr(self.backend, "sqe", None)
+                if sqe is not None:  # split-charge equilibration (plato_lr sqe), float64 per structure
+                    se_l: List[torch.Tensor] = []
+                    sq_l: List[torch.Tensor] = []
+                    for k, system in enumerate(systems):
+                        idx = torch.nonzero(system_indices == k).flatten()
+                        periodic = bool(system.pbc.any())
+                        formal = None
+                        if "mtt::formal_charges" in system.known_data() and not periodic:
+                            formal = system.get_data("mtt::formal_charges").block().values.reshape(-1)
+                        sp = self.backend.species_to_species_index[system.types.to(torch.long)]
+                        ea, qa, _ = sqe.forward_system(sp, positions[idx], charges[k], formal,
+                                                       cells[k] if periodic else None, periodic)
+                        se_l.append(ea.to(positions.dtype))
+                        sq_l.append(qa.detach())
+                    batch_data["sqe_e"] = torch.cat(se_l)
+                    self._sqe_charges = torch.cat(sq_l)  # for inspection
+                    if sqe.backbone_neutral:  # ablation: the total charge enters only through SQE
+                        batch_data["charge"] = torch.zeros_like(charges)
 
             # ===== BEGIN DIAGNOSTIC-RELATED BLOCK
             # Allow direct diagnostic capture of raw featurizer input tensors (e.g.

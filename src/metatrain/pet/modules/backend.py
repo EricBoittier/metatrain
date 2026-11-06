@@ -163,6 +163,7 @@ class PETBackend(torch.nn.Module):
         self.mesh: Optional[PETMeshCoupling] = None
         self.les: Optional[PETLES] = None
         self.frag: Optional[PETFragCharges] = None
+        self.sqe: Optional[torch.nn.Module] = None  # plato_lr sqe (modules/sqe.py)
         self.les_targets: List[str] = []
         plato_lr = hypers.get("plato_lr")
         if plato_lr is not None:
@@ -538,6 +539,10 @@ class PETBackend(torch.nn.Module):
             if self.frag is not None and self.les is not None and output_name in self.les_targets \
                     and "frag_e" in batch_data:  # beyond-cutoff fragment Coulomb (eV -> model units)
                 block_sums[0] = block_sums[0] + (batch_data["frag_e"] / (self.les.charge_unit ** 2))[:, None]
+
+            if self.sqe is not None and self.les is not None and output_name in self.les_targets \
+                    and "sqe_e" in batch_data:  # split-charge equilibration energy (eV -> model units)
+                block_sums[0] = block_sums[0] + (batch_data["sqe_e"] / (self.les.charge_unit ** 2))[:, None]
 
             atomic_predictions[output_name] = block_sums
 
