@@ -223,6 +223,23 @@ class PlatoLRHypers(TypedDict):
     ``les_thole_a``)."""
     les_thole_a: float = 0.39
     """Start value of the Thole ``a_T``."""
+    sqe: bool = False
+    """Split-charge equilibration energy (``modules/sqe.py``) added to the energy targets: charges minimise
+    ``sum_i chi_i q_i + J_i q_i^2 / 2 + sum_{i<j} q_i q_j gamma_ij + sum_pairs kappa_ij p_ij^2 / 2`` with bounded
+    ``chi`` (Mulliken +- ``sqe_dchi_max``), ``J`` (``[0.75, 2] (IP - EA)``) and bond hardness ``kappa(r)``
+    (increasing, infinite at ``sqe_r_ct``). Needs ``les`` (energy unit; keep its gate at 0)."""
+    sqe_q0: Literal["uniform", "formal"] = "uniform"
+    """Reference charges: ``Q / N``, or the system data ``mtt::formal_charges`` (fallback ``Q / N``)."""
+    sqe_backbone_charge: Literal["input", "neutral"] = "input"
+    """``neutral``: the backbone is conditioned on charge 0 (the charge enters only through SQE)."""
+    sqe_r_ct: float = 6.0
+    """Charge-transfer cutoff (A): no split charge beyond it."""
+    sqe_dchi_max: float = 2.0
+    """Bound on the electronegativity change (eV)."""
+    sqe_kappa_init: float = 10.0
+    """Start bond hardness at the covalent bond length (eV)."""
+    sqe_w_init: float = 0.75
+    """Start decay length of the bond softness (A)."""
     seed: int = 0
     """Seed of the RoPE directions."""
 

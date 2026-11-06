@@ -570,6 +570,15 @@ def apply_plato_lr(backend: torch.nn.Module, h: dict) -> None:
                                       float(h.get("frag_sigma", 4.0)), float(h.get("frag_t", 0.5)), float(h.get("frag_scale", 1.0)),
                                       cond_width=int(backend.system_conditioning.project[2].out_features)
                                       if h.get("frag_cond_gate", False) else 0)
+    if h.get("sqe", False):
+        if backend.les is None:
+            raise ValueError("sqe needs les (energy unit and targets; keep its gate at 0 to switch LES off)")
+        from .sqe import PETSQE
+
+        zs = [z for z, i in sorted(((z, int(i)) for z, i in enumerate(backend.species_to_species_index.tolist())
+                                    if int(i) >= 0), key=lambda t: t[1])]
+        cfg = {k[4:]: float(v) for k, v in h.items() if k.startswith("sqe_") and k not in ("sqe_q0", "sqe_backbone_charge")}
+        backend.sqe = PETSQE(zs, cfg, str(h.get("sqe_q0", "uniform")), str(h.get("sqe_backbone_charge", "input")))
 
 
 def _smootherstep(x: torch.Tensor) -> torch.Tensor:
