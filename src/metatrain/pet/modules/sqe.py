@@ -91,6 +91,22 @@ EA_EV = [
 ]
 
 
+# Reference-charge (q0) ranges per element, Z = 1..103, used by sqe_q0 "learned" (bounded, see learned_q0):
+# - noble gases [0, 0] (q0 fixed at 0);
+# - halogens F Cl Br I At [-1, 0];
+# - main-group nonmetals and metalloids H B C N O Si P S As Se Te [-1, +1] (the range of Lewis formal charges in
+#   molecules; e.g. NH4+ N +1, carboxylate O -1; PO4 3- reachable as P + 4 O);
+# - every other element (metals) [0, min(max common oxidation state, 3)], common oxidation states from mendeleev 1.3.0
+#   ``oxistates`` (Greenwood & Earnshaw, Chemistry of the Elements, 2nd ed.): Li Na K Ag [0, 1], Mg Ca Zn Cu Hg [0, 2],
+#   Al Fe lanthanides [0, 3], ...
+Q0_LO = [-1, 0, 0, 0, -1, -1, -1, -1, -1, 0, 0, 0, 0, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1,
+         -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Q0_HI = [1, 0, 1, 2, 1, 1, 1, 1, 0, 0, 1, 2, 3, 1, 1, 1, 0, 0, 1, 2, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 3, 3, 1, 1, 0, 0, 1, 2,
+         3, 3, 3, 3, 3, 3, 3, 3, 1, 2, 3, 3, 3, 1, 0, 0, 1, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+         3, 3, 3, 2, 3, 3, 3, 3, 0, 0, 1, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+
+
 def mulliken_chi(z: int) -> float:
     """``(IP + EA) / 2`` (eV)."""
     return 0.5 * (IP_EV[z - 1] + EA_EV[z - 1])
@@ -149,6 +165,15 @@ class SQEParams(torch.nn.Module):
         self.kappa_z = torch.nn.Parameter(torch.full((E,), _logit(lk), dtype=dt))
         self.w_raw = torch.nn.Parameter(torch.full((1,), _logit((c["w_init"] - c["w_lo"]) / (c["w_hi"] - c["w_lo"])),
                                                    dtype=dt))
+        # learned reference charges (sqe_q0 learned): q0_i = lo_Z + (hi_Z - lo_Z) sigmoid(f_i + t), f_i = q0_a[Z_i] +
+        # sum_Z' q0_b[Z_i, Z'] CN_{i,Z'} (element-resolved D3 coordination numbers), t the shift with sum q0 = Q.
+        # Start: q0 near 0 (metals logit -3, halogens +3, nonmetals 0), so the start is close to Q / N.
+        self.register_buffer("q0_lo", torch.tensor([float(Q0_LO[z - 1]) for z in zs], dtype=dt))
+        self.register_buffer("q0_hi", torch.tensor([float(Q0_HI[z - 1]) for z in zs], dtype=dt))
+        a0 = [(-3.0 if Q0_LO[z - 1] == 0 else (3.0 if Q0_HI[z - 1] == 0 else 0.0)) for z in zs]
+        self.q0_a = torch.nn.Parameter(torch.tensor(a0, dtype=dt))
+        self.q0_b = torch.nn.Parameter(torch.zeros(E, E, dtype=dt))
+        self.learned_q0 = False
 
     def _apply(self, fn, recurse=True):
         """Device moves apply; dtype casts do not: the parameters and tables stay float64 (as mlip.cpp's)."""
@@ -200,6 +225,55 @@ def coordination(P: SQEParams, e: torch.Tensor, r: torch.Tensor) -> torch.Tensor
     R = P.rcov[e][:, None] + P.rcov[e][None, :]
     cnt = torch.sigmoid(16.0 * (4.0 / 3.0 * R / r - 1.0))
     return (cnt * switch_off(r, P.cfg["cn_on"], P.cfg["cn_off"]) * off).sum(1)
+
+
+def _shift_root(lo: torch.Tensor, d: torch.Tensor, f: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
+    """The shift t with sum(lo + d sigmoid(f + t)) = Q: bisection (no gradient) to the root, then three Newton steps
+    with gradients, so that t(f, Q) and its first and second derivatives are exact (implicit-function derivatives:
+    dt/df_i = -w_i / sum w, w = d sigmoid')."""
+    with torch.no_grad():
+        S = lambda t: float((lo + d * torch.sigmoid(f + t)).sum())
+        a, b = -60.0, 60.0
+        for _ in range(200):
+            m = 0.5 * (a + b)
+            a, b = (m, b) if S(m) < float(Q) else (a, m)
+        t0 = torch.tensor(0.5 * (a + b), dtype=f.dtype)
+    t = t0
+    for _ in range(3):
+        sg = torch.sigmoid(f + t)
+        t = t - ((lo + d * sg).sum() - Q) / (d * sg * (1 - sg)).sum().clamp_min(1e-300)
+    return t
+
+
+def learned_q0(P: SQEParams, e: torch.Tensor, r: torch.Tensor, Q: torch.Tensor,
+               cnt: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Bounded learned reference charges with sum = Q (open structures; ``cnt`` the per-pair counting weights, n x n).
+    Every q0_i stays in [lo_Z, hi_Z]: the total-charge constraint is a common logit shift t (monotonic, so unique),
+    differentiable through the implicit function theorem. If Q is outside [sum lo, sum hi] (infeasible), t saturates
+    and the remainder is spread uniformly (bounds then broken; reported in the extras)."""
+    n = e.shape[0]
+    if cnt is None:
+        off = 1.0 - torch.eye(n, dtype=r.dtype, device=r.device)
+        R = P.rcov[e][:, None] + P.rcov[e][None, :]
+        cnt = torch.sigmoid(16.0 * (4.0 / 3.0 * R / r - 1.0)) * switch_off(r, P.cfg["cn_on"], P.cfg["cn_off"]) * off
+    oh = torch.nn.functional.one_hot(e, P.q0_a.shape[0]).to(r.dtype)
+    cnp = cnt @ oh  # CN_{i, Z'}
+    f = P.q0_a[e] + (cnp * P.q0_b[e]).sum(-1)
+    lo, d = P.q0_lo[e], P.q0_hi[e] - P.q0_lo[e]
+    Qd = Q.to(r.dtype).reshape(())
+    if float(lo.sum()) < float(Qd) < float((lo + d).sum()):
+        t = _shift_root(lo, d, f, Qd)
+        return lo + d * torch.sigmoid(f + t)
+    t = torch.tensor(60.0 if float(Qd) >= float((lo + d).sum()) else -60.0, dtype=r.dtype)
+    q = lo + d * torch.sigmoid(f + t)
+    return q + (Qd - q.sum()) / n
+
+
+def q0_fragment_loss(q0: torch.Tensor, unit: torch.Tensor, Qu: torch.Tensor) -> torch.Tensor:
+    """Optional supervision of the learned q0 (training only, never an input): mean over units of (sum_{i in u} q0_i -
+    Q_u)^2, ``unit`` the unit index per atom, ``Qu`` the units' integer (formal) charges."""
+    s = torch.zeros(Qu.shape[0], dtype=q0.dtype, device=q0.device).index_add_(0, unit, q0)
+    return ((s - Qu.to(q0.dtype)) ** 2).mean()
 
 
 def softness(P: SQEParams, e: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
@@ -281,11 +355,15 @@ def sqe_system(P: SQEParams, e: torch.Tensor, pos: torch.Tensor, Q: torch.Tensor
     pos = pos.to(torch.float64)
     n = pos.shape[0]
     Qd = Q.to(torch.float64).reshape(())
-    if q0 is None:
+    r = _pair_r(pos)
+    if P.learned_q0:
+        if periodic:
+            raise ValueError("sqe: learned q0 is not implemented for periodic structures")
+        q0 = learned_q0(P, e, r, Qd)
+    elif q0 is None:
         q0 = Qd.expand(n) / n
     else:
         q0 = q0.to(torch.float64)
-    r = _pair_r(pos)
     cn = coordination(P, e, r) if not periodic else coordination_periodic(P, e, pos, cell)
     chi = P.chi(e, cn)
     J = P.J(e)
@@ -305,7 +383,7 @@ def sqe_system(P: SQEParams, e: torch.Tensor, pos: torch.Tensor, Q: torch.Tensor
     bond = 0.25 * (s * dmu * dmu).sum(1)  # 1/2 sum_pairs, split half-half over the two atoms
     e_atom = chi * q + 0.5 * q * (A @ q) + bond
     p = -s * dmu  # p_ij (antisymmetric)
-    return e_atom.to(out_dtype), q.to(out_dtype), dict(chi=chi, J=J, cn=cn, mu=mu, p=p, s=s)
+    return e_atom.to(out_dtype), q.to(out_dtype), dict(chi=chi, J=J, cn=cn, mu=mu, p=p, s=s, q0=q0)
 
 
 def coordination_periodic(P: SQEParams, e: torch.Tensor, pos: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
@@ -347,12 +425,13 @@ class PETSQE(torch.nn.Module):
     def __init__(self, atomic_numbers: List[int], cfg: Optional[Dict[str, float]] = None, q0: str = "uniform",
                  backbone_charge: str = "input") -> None:
         super().__init__()
-        if q0 not in ("uniform", "formal"):
-            raise ValueError(f"sqe_q0 must be uniform or formal, not {q0}")
+        if q0 not in ("uniform", "formal", "learned"):
+            raise ValueError(f"sqe_q0 must be uniform, formal or learned, not {q0}")
         if backbone_charge not in ("input", "neutral"):
             raise ValueError(f"sqe_backbone_charge must be input or neutral, not {backbone_charge}")
         self.params = SQEParams(atomic_numbers, cfg)
         self.q0_mode = q0
+        self.params.learned_q0 = q0 == "learned"  # formal charges are then never an input
         self.backbone_neutral = backbone_charge == "neutral"
 
     def forward_system(self, e: torch.Tensor, pos: torch.Tensor, Q: torch.Tensor, formal: Optional[torch.Tensor],
@@ -370,4 +449,6 @@ def spec_json(P: SQEParams) -> Dict[str, object]:
     with torch.no_grad():
         return dict(Z=P.atomic_numbers, chi0=P.chi0.tolist(), J0=P.J0.tolist(), rcov=P.rcov.tolist(),
                     sigma=P.sigma.tolist(), chi_a=P.chi_a.tolist(), chi_b=P.chi_b.tolist(), j_z=P.j_z.tolist(),
-                    kappa_z=P.kappa_z.tolist(), w_raw=float(P.w_raw[0]), cfg=dict(P.cfg))
+                    kappa_z=P.kappa_z.tolist(), w_raw=float(P.w_raw[0]), cfg=dict(P.cfg),
+                    q0_lo=P.q0_lo.tolist(), q0_hi=P.q0_hi.tolist(), q0_a=P.q0_a.tolist(),
+                    q0_b=P.q0_b.reshape(-1).tolist())

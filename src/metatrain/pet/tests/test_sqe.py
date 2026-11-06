@@ -131,3 +131,67 @@ def test_periodic_large_box_limit():
     ep, qp, _ = sqe_system(P, e, x + L / 2 - 1.5, torch.tensor(0.0), cell=torch.eye(3) * L, periodic=True)
     assert float(ep.sum()) == pytest.approx(float(ea.sum()), abs=2e-3)
     assert torch.allclose(q, qp, atol=1e-3)
+
+
+def learned_params(seed=4, scale=0.5):
+    P = random_params(seed, 0.3)
+    P.learned_q0 = True
+    g = torch.Generator().manual_seed(seed + 100)
+    with torch.no_grad():
+        P.q0_a.add_(scale * torch.randn(P.q0_a.shape, generator=g))
+        P.q0_b.add_(scale * torch.randn(P.q0_b.shape, generator=g))
+    return P
+
+
+@torch.no_grad()
+def test_learned_q0_bounds_and_total_charge():
+    from metatrain.pet.modules.sqe import _pair_r, learned_q0
+    P = learned_params()
+    for seed, Q in ((5, 0.0), (6, 1.0), (7, -1.0), (8, 2.0)):
+        e, x = cluster(10, seed=seed)
+        q0 = learned_q0(P, e, _pair_r(x), torch.tensor(Q))
+        assert float(q0.sum()) == pytest.approx(Q, abs=1e-10)
+        if float(P.q0_lo[e].sum()) < Q < float(P.q0_hi[e].sum()):
+            assert torch.all(q0 >= P.q0_lo[e] - 1e-12) and torch.all(q0 <= P.q0_hi[e] + 1e-12)
+        ea, q, aux = sqe_system(P, e, x, torch.tensor(Q))
+        assert torch.allclose(aux["q0"], q0) and float(q.sum()) == pytest.approx(Q, abs=1e-10)
+
+
+def test_learned_q0_forces_and_gradcheck():
+    P = learned_params(9)
+    e, x = cluster(6, seed=10, box=4.0)
+    xx = x.clone().requires_grad_(True)
+    F = -torch.autograd.grad(sqe_system(P, e, xx, torch.tensor(1.0))[0].sum(), xx)[0]
+    h = 1e-5
+    with torch.no_grad():
+        for a in range(x.shape[0]):
+            for c in range(3):
+                xp, xm = x.clone(), x.clone(); xp[a, c] += h; xm[a, c] -= h
+                fd = -(sqe_system(P, e, xp, torch.tensor(1.0))[0].sum() - sqe_system(P, e, xm, torch.tensor(1.0))[0].sum()) / (2 * h)
+                assert float(F[a, c]) == pytest.approx(float(fd), abs=1e-7)
+    names = [k for k, _ in P.named_parameters()]
+
+    def f(*vals):
+        orig = {k: P._parameters[k] for k in names}
+        for k, v in zip(names, vals):
+            P._parameters[k] = v
+        x2 = x.clone().requires_grad_(True)
+        E = sqe_system(P, e, x2, torch.tensor(1.0))[0].sum()
+        F2 = torch.autograd.grad(E, x2, create_graph=True)[0]
+        for k, v in orig.items():
+            P._parameters[k] = v
+        return E + 0.1 * (F2 ** 2).sum()
+
+    vals = tuple(p.detach().clone().requires_grad_(True) for p in P.parameters())
+    assert torch.autograd.gradcheck(f, vals, eps=1e-6, atol=1e-6)
+
+
+@torch.no_grad()
+def test_learned_q0_no_formal_input():
+    """In learned mode the formal charges are never used."""
+    from metatrain.pet.modules.sqe import PETSQE
+    m = PETSQE(ZS, None, "learned")
+    e, x = cluster(6, seed=11)
+    a = m.forward_system(e, x, torch.tensor(0.0), torch.tensor([1.0, -1.0, 0, 0, 0, 0]), None, False)[0].sum()
+    b = m.forward_system(e, x, torch.tensor(0.0), None, None, False)[0].sum()
+    assert float(a) == float(b)

@@ -228,8 +228,10 @@ class PlatoLRHypers(TypedDict):
     ``sum_i chi_i q_i + J_i q_i^2 / 2 + sum_{i<j} q_i q_j gamma_ij + sum_pairs kappa_ij p_ij^2 / 2`` with bounded
     ``chi`` (Mulliken +- ``sqe_dchi_max``), ``J`` (``[0.75, 2] (IP - EA)``) and bond hardness ``kappa(r)``
     (increasing, infinite at ``sqe_r_ct``). Needs ``les`` (energy unit; keep its gate at 0)."""
-    sqe_q0: Literal["uniform", "formal"] = "uniform"
-    """Reference charges: ``Q / N``, or the system data ``mtt::formal_charges`` (fallback ``Q / N``)."""
+    sqe_q0: Literal["uniform", "formal", "learned"] = "uniform"
+    """Reference charges: ``Q / N``; the system data ``mtt::formal_charges`` (fallback ``Q / N``); or ``learned``:
+    bounded per-element charges from element-resolved coordination numbers with sum = Q (formal charges then only as
+    optional training supervision, ``modules/sqe.py: q0_fragment_loss``)."""
     sqe_backbone_charge: Literal["input", "neutral"] = "input"
     """``neutral``: the backbone is conditioned on charge 0 (the charge enters only through SQE)."""
     sqe_r_ct: float = 6.0
