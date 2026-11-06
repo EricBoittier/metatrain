@@ -563,3 +563,115 @@ def apply_plato_lr(backend: torch.nn.Module, h: dict) -> None:
         )
     elif h.get("total_charge_constraint", False):
         raise ValueError("total_charge_constraint needs les: true")
+    if h.get("frag_charges", False):
+        if backend.system_conditioning is None or backend.les is None:
+            raise ValueError("frag_charges needs system_conditioning and les (for the energy unit)")
+        backend.frag = PETFragCharges(float(h.get("frag_R", 8.0)), float(h.get("frag_w", 2.0)), float(h.get("frag_tau", 0.1)),
+                                      float(h.get("frag_sigma", 4.0)), float(h.get("frag_t", 0.5)), float(h.get("frag_scale", 1.0)),
+                                      cond_width=int(backend.system_conditioning.project[2].out_features)
+                                      if h.get("frag_cond_gate", False) else 0)
+
+
+def _smootherstep(x: torch.Tensor) -> torch.Tensor:
+    """``6x^5 - 15x^4 + 10x^3`` on [0, 1] (C2: first and second derivatives vanish at both ends)."""
+    x = x.clamp(0.0, 1.0)
+    return x * x * x * (x * (6.0 * x - 15.0) + 10.0)
+
+
+class PETFragCharges(torch.nn.Module):
+    """Fragment-constrained charges (``frag_charges``): per-fragment charge conditioning of the backbone plus a
+    strictly beyond-cutoff Coulomb term between fixed fragment charges.
+
+    Units are the bonded fragments of a structure. Two atoms are bonded when closer than ``f (r_i + r_j)``, with
+    ``r`` the ASE covalent radii and ``f = 1.2`` (QCell / fragments.py), or ``f = 1.3`` when either atom is a
+    transition, lanthanide or post-transition metal (metal-ligand coordination, e.g. Zn-N 2.32 A). Alkali metals
+    (Li-Cs) never bond, so contact ion pairs stay two units. Units are the connected components. Unit ``u``
+    carries the integer charge ``Q_u``, the sum of the per-atom system data ``mtt::formal_charges``. Without that
+    data (and for periodic structures), a structure is one unit with its total charge and no Coulomb term: the plain
+    model, identical to the base.
+
+    - Conditioning: every atom is conditioned on its unit's charge (the system's spin), at every distance, so a
+      contact ion pair is +1/-1.
+    - Charges: ``Q_u / n_u`` on each atom of the unit.
+    - Energy: ``1/2 KE sum_{i != j} q_i q_j erf(r / (sqrt 2 sigma)) / r T(r)``, where ``T`` rises smoothly from 0
+      at ``R - t`` to 1 at ``R``: zero inside the receptive field, no free amplitude. Open structures only.
+
+    Bond making and breaking change the units discontinuously; a fade for reactive dynamics is not implemented.
+
+    ``frag_cond_gate``: instead of replacing the structure-charge conditioning, add the unit-charge conditioning as a
+    gated correction ``c(Q_s) + g * (c(Q_u) - c(Q_s))`` with a per-channel ``g`` (``cond_gate``) initialised at zero,
+    so that the start equals the base model plus the Coulomb term.
+    """
+
+    def __init__(self, R: float = 8.0, w: float = 2.0, tau: float = 0.1, sigma: float = 4.0, t: float = 0.5,
+                 scale: float = 1.0, cond_width: int = 0) -> None:
+        super().__init__()
+        # frag_cond_gate: the conditioning stays c(Q_s) and the unit charges enter as c(Q_s) + g (c(Q_u) - c(Q_s)),
+        # g per channel and zero-initialised (the start is exactly the base model; the Coulomb term is unchanged)
+        self.cond_gate: Optional[torch.nn.Parameter] = (
+            torch.nn.Parameter(torch.zeros(cond_width)) if cond_width > 0 else None)
+        self.R, self.w, self.tau, self.sigma, self.t, self.scale = float(R), float(w), float(tau), float(sigma), float(t), float(scale)
+        from ase.data import covalent_radii
+        self.register_buffer("cov", torch.tensor(covalent_radii, dtype=torch.float64), persistent=False)
+        fac = torch.full((len(covalent_radii),), 1.2, dtype=torch.float64)
+        metal = list(range(21, 31)) + list(range(39, 49)) + list(range(57, 81)) + [13, 31, 49, 50, 81, 82, 83]
+        fac[metal] = 1.3
+        alk = torch.zeros(len(covalent_radii), dtype=torch.bool)
+        alk[[3, 11, 19, 37, 55, 87]] = True
+        self.register_buffer("fac", fac, persistent=False)
+        self.register_buffer("alkali", alk, persistent=False)
+
+    def bonded_units(self, z: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """Unit label per atom (0..U-1) by the bond rule above."""
+        n = pos.shape[0]
+        with torch.no_grad():
+            r = self.cov.to(pos.dtype)[z]; f = self.fac.to(pos.dtype)[z]; al = self.alkali[z]
+            thr = torch.maximum(f[:, None], f[None, :]) * (r[:, None] + r[None, :])
+            adj = (torch.cdist(pos.detach(), pos.detach()) < thr) & ~(al[:, None] | al[None, :])
+            lab = torch.arange(n, device=pos.device)
+            for _ in range(n):
+                new = torch.minimum(torch.where(adj, lab[None, :], n).min(1).values, lab)
+                if torch.equal(new, lab):
+                    break
+                lab = new
+            _, lab = torch.unique(lab, return_inverse=True)
+        return lab
+
+    def units(self, z: torch.Tensor, pos: torch.Tensor, formal: Optional[torch.Tensor], Q: torch.Tensor):
+        """``(labels (n,), Q_u (U,), n_u (U,), C (U, U) = identity)`` for one structure."""
+        n = pos.shape[0]
+        if formal is None:
+            lab = torch.zeros(n, dtype=torch.long, device=pos.device)
+            return lab, Q.reshape(1).to(pos.dtype), torch.full((1,), float(n), dtype=pos.dtype, device=pos.device), \
+                torch.ones(1, 1, dtype=pos.dtype, device=pos.device)
+        lab = self.bonded_units(z, pos)
+        U = int(lab.max()) + 1
+        oh = torch.nn.functional.one_hot(lab, U).to(pos.dtype)
+        return lab, oh.T @ formal.to(pos.dtype), oh.sum(0), torch.eye(U, dtype=pos.dtype, device=pos.device)
+
+    def charges(self, lab, Qu, nu, C):
+        """``(Q_eff per atom, q per atom)``."""
+        Qeff = C @ Qu
+        Nv = C @ nu
+        qv = C @ (Qu / Nv)  # per unit u: sum_v c_uv Q_v / N_v
+        return Qeff[lab], qv[lab]
+
+    def energy(self, q: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """Per-atom energies (eV) of the beyond-``R`` Coulomb term."""
+        A = pos.shape[0]
+        off = ~torch.eye(A, dtype=torch.bool, device=pos.device)
+        d = torch.sqrt(((pos[:, None] - pos[None]) ** 2).sum(-1) + (~off).to(pos.dtype))
+        T = _smootherstep((d - (self.R - self.t)) / self.t)
+        k = torch.erf(d / (math.sqrt(2) * self.sigma)) / d * T * off.to(pos.dtype)
+        return self.scale * 0.5 * 14.399645 * q * (k @ q)
+
+    @staticmethod
+    def conditioning(sc: torch.nn.Module, qeff: torch.Tensor, spin: torch.Tensor) -> torch.Tensor:
+        """``SystemConditioningEmbedding`` evaluated per atom at the (possibly fractional) charge ``qeff``."""
+        x = (qeff + sc.max_charge).clamp(0.0, 2.0 * sc.max_charge)
+        f = x.detach().floor().clamp(max=2 * sc.max_charge - 1)
+        tt = (x - f)[:, None]
+        Ew = sc.charge_embedding.weight
+        c = (1 - tt) * Ew[f.long()] + tt * Ew[f.long() + 1]
+        s = sc.spin_multiplicity_embedding(spin - 1)
+        return sc.project(torch.cat([c, s], dim=-1))

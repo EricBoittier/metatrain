@@ -5,7 +5,7 @@ import torch
 
 from ..documentation import ModelHypers
 from .conditioning import SystemConditioningEmbedding
-from .plato_lr import PETLES, PETMeshCoupling, apply_plato_lr
+from .plato_lr import PETLES, PETFragCharges, PETMeshCoupling, apply_plato_lr
 from .structures import compute_batch_tensors
 from .transformer import CartesianTransformer
 
@@ -162,6 +162,7 @@ class PETBackend(torch.nn.Module):
         self.couple_at = -1
         self.mesh: Optional[PETMeshCoupling] = None
         self.les: Optional[PETLES] = None
+        self.frag: Optional[PETFragCharges] = None
         self.les_targets: List[str] = []
         plato_lr = hypers.get("plato_lr")
         if plato_lr is not None:
@@ -390,6 +391,8 @@ class PETBackend(torch.nn.Module):
             featurizer_inputs["charge"] = batch_data["charge"]
             featurizer_inputs["spin_multiplicity"] = batch_data["spin_multiplicity"]
             featurizer_inputs["system_indices"] = batch_data["system_indices"]
+            if "frag_qeff" in batch_data:
+                featurizer_inputs["frag_qeff"] = batch_data["frag_qeff"]
         if self.frame_rope:
             ev = batch_data["edge_vectors"]
             featurizer_inputs["token_positions"] = torch.cat(
@@ -532,6 +535,10 @@ class PETBackend(torch.nn.Module):
                     )[:, None]
                 )
 
+            if self.frag is not None and self.les is not None and output_name in self.les_targets \
+                    and "frag_e" in batch_data:  # beyond-cutoff fragment Coulomb (eV -> model units)
+                block_sums[0] = block_sums[0] + (batch_data["frag_e"] / (self.les.charge_unit ** 2))[:, None]
+
             atomic_predictions[output_name] = block_sums
 
         return atomic_predictions, node_ll_features, edge_ll_features
@@ -604,6 +611,15 @@ class PETBackend(torch.nn.Module):
                 inputs["spin_multiplicity"],
                 inputs["system_indices"],
             )
+            if self.frag is not None and "frag_qeff" in inputs:  # per-fragment (soft) charge conditioning
+                cond_unit = self.frag.conditioning(
+                    self.system_conditioning, inputs["frag_qeff"],
+                    inputs["spin_multiplicity"][inputs["system_indices"]],
+                )
+                if self.frag.cond_gate is not None:  # gated correction: c(Q_s) + g (c(Q_u) - c(Q_s))
+                    cond_embedding = cond_embedding + self.frag.cond_gate * (cond_unit - cond_embedding)
+                else:
+                    cond_embedding = cond_unit
 
         for layer_index, (
             combination_norm,
