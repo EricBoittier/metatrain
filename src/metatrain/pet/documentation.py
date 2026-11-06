@@ -240,6 +240,11 @@ class PlatoLRHypers(TypedDict):
     """Bound on the electronegativity change (eV)."""
     sqe_kappa_init: float = 10.0
     """Start bond hardness at the covalent bond length (eV)."""
+    sqe_lr_R: float = 0.0
+    """If > 0: only the long-range part E*(gamma) - E*(gamma (1 - T(r))) is added (T rising from 0 at
+    ``sqe_lr_R - sqe_lr_t`` to 1 at ``sqe_lr_R``): zero for structures without pairs beyond ``sqe_lr_R - sqe_lr_t``."""
+    sqe_lr_t: float = 1.0
+    """Width of the long-range switch (A)."""
     sqe_w_init: float = 0.75
     """Start decay length of the bond softness (A)."""
     seed: int = 0

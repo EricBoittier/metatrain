@@ -195,3 +195,22 @@ def test_learned_q0_no_formal_input():
     a = m.forward_system(e, x, torch.tensor(0.0), torch.tensor([1.0, -1.0, 0, 0, 0, 0]), None, False)[0].sum()
     b = m.forward_system(e, x, torch.tensor(0.0), None, None, False)[0].sum()
     assert float(a) == float(b)
+
+
+def test_long_range_only_variant():
+    """sqe_lr_R: zero when no pair is beyond lr_R - lr_t; FD forces through the switch."""
+    P = random_params(12, 0.3)
+    P.cfg["lr_R"], P.cfg["lr_t"] = 6.0, 1.0
+    e, x = cluster(6, seed=13, box=3.0)  # all pairs < 5.2 A
+    with torch.no_grad():
+        assert float(sqe_system(P, e, x, torch.tensor(1.0))[0].sum()) == 0.0
+    x2 = x.clone(); x2[:3] += torch.tensor([3.5, 0.0, 0.0])  # pairs across the 5-6 A switch
+    xx = x2.clone().requires_grad_(True)
+    F = -torch.autograd.grad(sqe_system(P, e, xx, torch.tensor(1.0))[0].sum(), xx)[0]
+    h = 1e-5
+    with torch.no_grad():
+        for a in range(x2.shape[0]):
+            for c in range(3):
+                xp, xm = x2.clone(), x2.clone(); xp[a, c] += h; xm[a, c] -= h
+                fd = -(sqe_system(P, e, xp, torch.tensor(1.0))[0].sum() - sqe_system(P, e, xm, torch.tensor(1.0))[0].sum()) / (2 * h)
+                assert float(F[a, c]) == pytest.approx(float(fd), abs=1e-7)

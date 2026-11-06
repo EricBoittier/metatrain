@@ -130,7 +130,7 @@ def switch_off(r: torch.Tensor, r_on: float, r_off: float) -> torch.Tensor:
 
 DEFAULTS: Dict[str, float] = dict(
     r_ct=6.0, r_ct_width=1.0, dchi_max=2.0, J_lo=0.75, J_hi=2.0, kappa_lo=1.0, kappa_hi=100.0, kappa_init=10.0,
-    w_lo=0.2, w_hi=2.0, w_init=0.75, cn_on=4.0, cn_off=5.0, ewald_alpha=0.0,
+    w_lo=0.2, w_hi=2.0, w_init=0.75, cn_on=4.0, cn_off=5.0, ewald_alpha=0.0, lr_R=0.0, lr_t=1.0,
 )
 
 
@@ -374,15 +374,26 @@ def sqe_system(P: SQEParams, e: torch.Tensor, pos: torch.Tensor, Q: torch.Tensor
     else:
         gam = gaussian_coulomb_open(P, e, r)
         s = softness(P, e, r)
-    A = gam + torch.diag(J)
     Lm = torch.diag(s.sum(1)) - s
-    eye = torch.eye(n, dtype=torch.float64)
-    q = torch.linalg.solve(eye + Lm @ A, (q0 - Lm @ chi)[:, None])[:, 0]
-    mu = chi + A @ q
-    dmu = mu[:, None] - mu[None, :]
-    bond = 0.25 * (s * dmu * dmu).sum(1)  # 1/2 sum_pairs, split half-half over the two atoms
-    e_atom = chi * q + 0.5 * q * (A @ q) + bond
-    p = -s * dmu  # p_ij (antisymmetric)
+
+    def minimum(g: torch.Tensor):
+        A = g + torch.diag(J)
+        q = torch.linalg.solve(torch.eye(n, dtype=torch.float64) + Lm @ A, (q0 - Lm @ chi)[:, None])[:, 0]
+        mu = chi + A @ q
+        dmu = mu[:, None] - mu[None, :]
+        bond = 0.25 * (s * dmu * dmu).sum(1)  # 1/2 sum_pairs, split half-half over the two atoms
+        return chi * q + 0.5 * q * (A @ q) + bond, q, mu, -s * dmu
+
+    e_atom, q, mu, p = minimum(gam)
+    if P.cfg["lr_R"] > 0:
+        # long-range part only (sqe_lr_R): E*(gamma) - E*(gamma (1 - T)), T the smootherstep from 0 at lr_R - lr_t to 1
+        # at lr_R. Both are minima of the same functional (Hellmann-Feynman forces each); the difference is exactly 0
+        # when no pair is farther than lr_R - lr_t, so inside the receptive field the backbone is untouched.
+        if periodic:
+            raise ValueError("sqe: lr_R is not implemented for periodic structures")
+        T = smootherstep((r - (P.cfg["lr_R"] - P.cfg["lr_t"])) / P.cfg["lr_t"])
+        e_loc = minimum(gam * (1.0 - T))[0]
+        e_atom = e_atom - e_loc
     return e_atom.to(out_dtype), q.to(out_dtype), dict(chi=chi, J=J, cn=cn, mu=mu, p=p, s=s, q0=q0)
 
 
