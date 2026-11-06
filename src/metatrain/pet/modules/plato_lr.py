@@ -567,7 +567,9 @@ def apply_plato_lr(backend: torch.nn.Module, h: dict) -> None:
         if backend.system_conditioning is None or backend.les is None:
             raise ValueError("frag_charges needs system_conditioning and les (for the energy unit)")
         backend.frag = PETFragCharges(float(h.get("frag_R", 8.0)), float(h.get("frag_w", 2.0)), float(h.get("frag_tau", 0.1)),
-                                      float(h.get("frag_sigma", 4.0)), float(h.get("frag_t", 0.5)), float(h.get("frag_scale", 1.0)))
+                                      float(h.get("frag_sigma", 4.0)), float(h.get("frag_t", 0.5)), float(h.get("frag_scale", 1.0)),
+                                      cond_width=int(backend.system_conditioning.project[2].out_features)
+                                      if h.get("frag_cond_gate", False) else 0)
 
 
 def _smootherstep(x: torch.Tensor) -> torch.Tensor:
@@ -595,11 +597,19 @@ class PETFragCharges(torch.nn.Module):
       at ``R - t`` to 1 at ``R``: zero inside the receptive field, no free amplitude. Open structures only.
 
     Bond making and breaking change the units discontinuously; a fade for reactive dynamics is not implemented.
+
+    ``frag_cond_gate``: instead of replacing the structure-charge conditioning, add the unit-charge conditioning as a
+    gated correction ``c(Q_s) + g * (c(Q_u) - c(Q_s))`` with a per-channel ``g`` (``cond_gate``) initialised at zero,
+    so that the start equals the base model plus the Coulomb term.
     """
 
     def __init__(self, R: float = 8.0, w: float = 2.0, tau: float = 0.1, sigma: float = 4.0, t: float = 0.5,
-                 scale: float = 1.0) -> None:
+                 scale: float = 1.0, cond_width: int = 0) -> None:
         super().__init__()
+        # frag_cond_gate: the conditioning stays c(Q_s) and the unit charges enter as c(Q_s) + g (c(Q_u) - c(Q_s)),
+        # g per channel and zero-initialised (the start is exactly the base model; the Coulomb term is unchanged)
+        self.cond_gate: Optional[torch.nn.Parameter] = (
+            torch.nn.Parameter(torch.zeros(cond_width)) if cond_width > 0 else None)
         self.R, self.w, self.tau, self.sigma, self.t, self.scale = float(R), float(w), float(tau), float(sigma), float(t), float(scale)
         from ase.data import covalent_radii
         self.register_buffer("cov", torch.tensor(covalent_radii, dtype=torch.float64), persistent=False)

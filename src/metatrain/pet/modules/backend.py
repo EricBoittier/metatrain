@@ -612,10 +612,14 @@ class PETBackend(torch.nn.Module):
                 inputs["system_indices"],
             )
             if self.frag is not None and "frag_qeff" in inputs:  # per-fragment (soft) charge conditioning
-                cond_embedding = self.frag.conditioning(
+                cond_unit = self.frag.conditioning(
                     self.system_conditioning, inputs["frag_qeff"],
                     inputs["spin_multiplicity"][inputs["system_indices"]],
                 )
+                if self.frag.cond_gate is not None:  # gated correction: c(Q_s) + g (c(Q_u) - c(Q_s))
+                    cond_embedding = cond_embedding + self.frag.cond_gate * (cond_unit - cond_embedding)
+                else:
+                    cond_embedding = cond_unit
 
         for layer_index, (
             combination_norm,
