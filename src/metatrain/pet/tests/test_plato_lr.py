@@ -353,3 +353,125 @@ def test_les_tail(subtract):
     else:
         assert torch.isfinite(e1).all() and torch.isfinite(f1).all()
         assert not torch.allclose(e0, e1)
+
+
+# ---- Fukui charge equilibration (les_charge_equilibration, feat/plato-lr-fukui) ----------------------------------
+FUKUI_MODES = ["element", "atom", "atom_pm", "atom_cluster"]
+
+
+def open_systems(model, charges):
+    """Open molecules (O C H4 at random positions) with the given (charge, spin) pairs."""
+    g = torch.Generator().manual_seed(7)
+    out = []
+    for q, spin in charges:
+        pos = torch.rand(6, 3, generator=g, dtype=torch.float64) * 3.5
+        s = System(types=torch.tensor([8, 6, 1, 1, 1, 1]), positions=pos.requires_grad_(),
+                   cell=torch.zeros(3, 3, dtype=torch.float64), pbc=torch.tensor([False] * 3))  # fmt: skip
+        s.add_data("charge", scalar(q, "charge"))
+        s.add_data("spin_multiplicity", scalar(spin, "spin_multiplicity"))
+        out.append(get_system_with_neighbor_lists(s, model.requested_neighbor_lists()))
+    return out
+
+
+def fukui_model(mode, **kw):
+    model = small_pet()
+    conv = convert_model(model, dict(ALL, mesh_coupling=False, les_charge_equilibration=mode, **kw))
+    with torch.no_grad():
+        conv.backend.les.les_gate.fill_(1.0)
+        conv.backend.les.fukui_phi.normal_(0, 0.5)
+    conv.eval()
+    return model, conv
+
+
+@pytest.mark.parametrize("mode", FUKUI_MODES)
+def test_fukui_sum_equals_total_charge(mode):
+    model, conv = fukui_model(mode)
+    les = conv.backend.les
+    rec = []
+    eq = les.equilibrate
+    les.equilibrate = lambda qs, Q, f, pos: rec.append(eq(qs, Q, f, pos)) or rec[-1]
+    cases = [(1.0, 2), (-1.0, 2), (0.0, 1), (2.0, 1), (0.0, 3)]
+    energy_forces(conv, open_systems(model, cases))
+    assert len(rec) == len(cases)
+    for qs, (Q, _) in zip(rec, cases):
+        assert torch.allclose(qs.sum(0) * les.charge_unit, torch.tensor([Q]).double(), atol=1e-12)
+
+
+def test_fukui_uniform_is_the_plain_shift():
+    model = small_pet()
+    a = convert_model(model, dict(ALL, les_charge_equilibration="uniform"))
+    b = convert_model(model, ALL)
+    for m in (a, b):
+        with torch.no_grad():
+            m.backend.les.les_gate.fill_(1.0)
+        m.eval()
+    syst = systems(model)
+    ea, fa = energy_forces(a, syst)
+    eb, fb = energy_forces(b, syst)
+    assert torch.equal(ea, eb) and torch.equal(fa, fb)
+    assert a.backend.les.fukui_head is None
+
+
+@pytest.mark.parametrize("mode", ["atom", "atom_pm", "atom_cluster"])
+def test_fukui_atom_heads_live_and_not_zero_init(mode):
+    model, conv = fukui_model(mode)
+    les = conv.backend.les
+    last = les.fukui_head["node"][0][2]
+    assert last.weight.abs().max() > 0  # default init, not a zero gate
+    syst = open_systems(model, [(1.0, 2), (-1.0, 2)])
+    e = conv(syst, {"energy": ModelOutput(sample_kind="system")})["energy"].block().values.sum(-1)
+    e.sum().backward()
+    assert last.weight.grad is not None and last.weight.grad.abs().max() > 0
+    _, conv_e = fukui_model("element")
+    ee, _ = energy_forces(conv_e, open_systems(model, [(1.0, 2), (-1.0, 2)]))
+    assert not torch.allclose(e.detach(), ee.detach())
+
+
+def test_fukui_cluster_projection_keeps_neutral_partner():
+    from metatrain.pet.modules.plato_lr import fukui_cluster_projection
+
+    pos = torch.tensor([[0.0, 0, 0], [1.0, 0, 0], [30.0, 0, 0], [31.0, 0, 0], [30.5, 0.9, 0]], dtype=torch.float64)
+    q = torch.tensor([[0.60], [0.37], [0.05], [-0.03], [0.02]], dtype=torch.float64)  # cluster sums 0.97 / 0.04
+    f = torch.tensor([[1.0], [0.5], [0.8], [0.3], [0.3]], dtype=torch.float64)
+    Q = 1.0
+    out = fukui_cluster_projection(q, f, torch.tensor([Q]) - q.sum(0), pos, 8.0, 0.6)
+    assert torch.allclose(out.sum(0), torch.tensor([Q]).double(), atol=1e-12)
+    assert abs(float(out[2:].sum())) < 1e-12 and abs(float(out[:2].sum()) - 1.0) < 1e-12
+    # the global equilibration leaks the residual onto the neutral partner by its Fukui share
+    glob = q + f / f.sum(0) * (Q - q.sum(0))
+    assert abs(float(glob[2:].sum())) > 1e-3
+
+
+def test_fukui_pm_blend_kink():
+    """atom_pm: dq/dr is continuous at r = 0 with a blend width, and jumps by (w- - w+) with the hard switch."""
+    model, conv = fukui_model("atom_pm")
+    les = conv.backend.les
+    qs = torch.tensor([[0.3], [-0.2], [0.1]], dtype=torch.float64)
+    f = torch.tensor([[1.0, 0.2], [0.5, 0.9], [0.3, 0.4]], dtype=torch.float64)
+    pos = torch.zeros(3, 3, dtype=torch.float64)
+    for d, kink in [(0.05, False), (0.0, True)]:
+        les.fukui_pm_width = d
+        der = []
+        for sgn in (1.0, -1.0):
+            Q = torch.tensor([float(qs.sum()) + sgn * 1e-6], dtype=torch.float64, requires_grad=True)
+            out = les.equilibrate(qs, Q, f, pos)
+            der.append(torch.autograd.grad(out[0, 0], Q)[0])
+        jump = float((der[0] - der[1]).abs())
+        assert (jump > 1e-3) if kink else (jump < 1e-4)
+
+
+def test_fukui_atom_export(tmp_path):
+    model, conv = fukui_model("atom")
+    syst = systems(model)
+    e0, _ = energy_forces(conv, syst)
+    exported = conv.export()
+    path = str(tmp_path / "model.pt")
+    exported.save(path)
+    from metatomic.torch import ModelEvaluationOptions, load_atomistic_model
+
+    loaded = load_atomistic_model(path)
+    opts = ModelEvaluationOptions(
+        length_unit="Angstrom", outputs={"energy": ModelOutput(sample_kind="system")}
+    )
+    e2 = loaded(systems(model), opts, check_consistency=True)["energy"].block().values.sum(-1)
+    assert torch.allclose(e0.detach(), e2.detach(), rtol=0, atol=1e-12)

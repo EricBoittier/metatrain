@@ -203,6 +203,26 @@ class PlatoLRHypers(TypedDict):
     total_charge_constraint: bool = False
     """Shift the latent charges to sum to the system charge (``charge`` input, needs
     ``system_conditioning``) instead of to zero."""
+    les_charge_equilibration: Literal["uniform", "element", "atom", "atom_pm", "atom_cluster"] = "uniform"
+    """How ``total_charge_constraint`` moves the latent charges to the system charge ``Q``
+    (MACE-POLAR-1-style Fukui equilibration, ``q_i <- q_i + w_i (Q - sum_j q_j)``, ``w = f / sum f``):
+    ``uniform`` ``f = 1`` (the plain shift); ``element`` ``f = softplus(phi_Z)``; ``atom``
+    ``f = softplus(phi_Z + a_i)``, ``a_i`` a learned per-atom head of the charge head's shape
+    (environment-dependent Fukui weights); ``atom_pm`` separate ``f+`` / ``f-`` heads blended by the
+    residual ``r = Q - sum q``, ``w = (1 - s) f+ / F+ + s f- / F-``, ``s = smootherstep(r / d + 1/2)``
+    (``d = les_fukui_pm_width``; 0 = hard switch with a force kink at ``r = 0``); ``atom_cluster`` per-atom
+    ``f`` with the equilibration per hard single-link cluster (``les_fukui_cluster_r``): cluster totals moved
+    to plateaued values (width ``les_fukui_cluster_w``), the residual routed by the plateau slope, so
+    near-integer neutral clusters keep their charge (open structures; cluster membership is not smooth in
+    the positions: for charge-supervised training, the smooth runtime version is mlip.cpp's lrc graph mode).
+    ``phi`` starts at 0, the ``a`` heads at the default (non-zero) init. Needs ``total_charge_constraint``.
+    mlip.cpp export: uniform only (the lrc graph mode carries the other modes)."""
+    les_fukui_pm_width: float = 0.05
+    """``atom_pm``: width (charge units of ``Q``) of the blend between ``f+`` and ``f-``."""
+    les_fukui_cluster_w: float = 0.6
+    """``atom_cluster``: plateau width of the cluster totals."""
+    les_fukui_cluster_r: float = 8.0
+    """``atom_cluster``: single-link cluster distance (A)."""
     les_tail_sigma: float = 0.0
     """LES tail: the Gaussian width (A) of the LES energy instead of ``les_sigma``
     (periodic: reciprocal sum without self terms, k cutoff ``les_kcut /
