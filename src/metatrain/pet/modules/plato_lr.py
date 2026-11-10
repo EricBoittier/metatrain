@@ -367,6 +367,10 @@ class PETLES(torch.nn.Module):
         thole: bool = False,
         thole_a: float = 0.39,
         atomic_types: Optional[List[int]] = None,
+        equilibration: str = "uniform",
+        fukui_pm_width: float = 0.05,
+        fukui_cluster_w: float = 0.6,
+        fukui_cluster_r: float = 8.0,
     ) -> None:
         super().__init__()
 
@@ -375,6 +379,13 @@ class PETLES(torch.nn.Module):
                 torch.nn.Linear(d, d_head),
                 torch.nn.SiLU(),
                 torch.nn.Linear(d_head, num_charges),
+            )
+
+        def fhead(d: int, c: int) -> torch.nn.Module:
+            return torch.nn.Sequential(
+                torch.nn.Linear(d, d_head),
+                torch.nn.SiLU(),
+                torch.nn.Linear(d_head, c),
             )
 
         self.charge_head = torch.nn.ModuleDict(
@@ -393,6 +404,34 @@ class PETLES(torch.nn.Module):
         if self.tail_subtract_cutoff and not self.tail_sigma > 0:
             raise ValueError("les_tail_subtract_cutoff needs les_tail_sigma > 0")
         self.total_charge_constraint = total_charge_constraint
+        if equilibration not in ("uniform", "element", "atom", "atom_pm", "atom_cluster"):
+            raise ValueError(f"unknown les_charge_equilibration '{equilibration}'")
+        if equilibration != "uniform" and not total_charge_constraint:
+            raise ValueError("les_charge_equilibration other than uniform needs total_charge_constraint")
+        if equilibration != "uniform" and atomic_types is None:
+            raise ValueError("les_charge_equilibration needs the atomic types")
+        self.equilibration = equilibration
+        self.fukui_pm_width = float(fukui_pm_width)
+        self.fukui_cluster_w = float(fukui_cluster_w)
+        self.fukui_cluster_r = float(fukui_cluster_r)
+        nf = 2 if equilibration == "atom_pm" else 1
+        ns = len(atomic_types) if atomic_types is not None else 0
+        # per-element Fukui logits phi (start 0: f = softplus(0) for every element) and, for the per-atom modes, a
+        # head of the charge head's shape (default, non-zero init: no gate); channels [f+ (, f-)] x num_charges
+        if equilibration == "uniform":  # no parameter (an unused one would break DDP / the live-gradient checks)
+            self.register_buffer("fukui_phi", torch.zeros(0, nf * num_charges), persistent=False)
+        else:
+            self.fukui_phi = torch.nn.Parameter(torch.zeros(ns, nf * num_charges))
+        self.fukui_head = torch.nn.ModuleDict(
+            {
+                "node": torch.nn.ModuleList(
+                    [fhead(d_node, nf * num_charges) for _ in range(num_readout_layers)]
+                ),
+                "edge": torch.nn.ModuleList(
+                    [fhead(d_pet, nf * num_charges) for _ in range(num_readout_layers)]
+                ),
+            }
+        ) if equilibration in ("atom", "atom_pm", "atom_cluster") else None
         self.les_gate = torch.nn.Parameter(torch.zeros(1))
         self.register_buffer("charge_unit", torch.ones(1))
         self.damp_screen = bool(damp_screen)
@@ -406,6 +445,15 @@ class PETLES(torch.nn.Module):
             self.les_screen_s = torch.nn.Parameter(torch.zeros(1))
             self.les_screen_kappa_raw = torch.nn.Parameter(torch.full((1,), inv(0.2)))
         self.thole = bool(thole)
+        if not self.damp_screen:  # TorchScript compiles every branch: placeholders when off (not in the state dict)
+            self.register_buffer("les_damp_w", torch.zeros(1), persistent=False)
+            self.register_buffer("les_damp_a_raw", torch.zeros(1), persistent=False)
+            self.register_buffer("les_screen_s", torch.zeros(1), persistent=False)
+            self.register_buffer("les_screen_kappa_raw", torch.zeros(1), persistent=False)
+        if not self.thole:
+            self.register_buffer("les_thole_ia", torch.zeros(0), persistent=False)
+            self.register_buffer("les_thole_w", torch.zeros(1), persistent=False)
+            self.register_buffer("les_thole_a_raw", torch.zeros(1), persistent=False)
         if self.thole:
             if not self.damp_screen or atomic_types is None:
                 raise ValueError("les_thole needs les_damp_screen and the atomic types")
@@ -437,6 +485,40 @@ class PETLES(torch.nn.Module):
             q = qi if i == 0 else q + qi
         return q
 
+    def fukui_weights(
+        self,
+        node_features_list: List[torch.Tensor],
+        edge_features_list: List[torch.Tensor],
+        padding_mask: torch.Tensor,
+        cutoff_factors: torch.Tensor,
+        species: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-atom Fukui weights ``f`` (A, nf * num_charges), ``softplus(phi_Z [+ a_i]) + 1e-6``."""
+        u = self.fukui_phi[species]
+        if self.fukui_head is not None:
+            for i, (nh, eh) in enumerate(
+                zip(self.fukui_head["node"], self.fukui_head["edge"], strict=True)  # type: ignore
+            ):
+                ae = eh(edge_features_list[i])
+                ae = torch.where(padding_mask[..., None], ae, 0.0)
+                u = u + nh(node_features_list[i]) + (ae * cutoff_factors[:, :, None]).sum(1)
+        return torch.nn.functional.softplus(u) + 1e-6
+
+    def equilibrate(self, qs: torch.Tensor, Q: torch.Tensor, f: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """Fukui equilibration of one structure's charges ``qs`` (n, C) to ``Q`` (model units) with weights ``f``."""
+        C = qs.shape[1]
+        r = Q - qs.sum(0)  # (C,)
+        fp = f[:, :C]
+        if self.equilibration == "atom_cluster":
+            return fukui_cluster_projection(qs, fp, r, pos, self.fukui_cluster_r, self.fukui_cluster_w)
+        w = fp / fp.sum(0)
+        if self.equilibration == "atom_pm":
+            fm = f[:, C:]
+            d = self.fukui_pm_width
+            s = _smootherstep(r / d + 0.5) if d > 0 else (r > 0).to(qs.dtype)
+            w = (1 - s) * w + s * fm / fm.sum(0)
+        return qs + w * r
+
     def forward(
         self,
         node_features_list: List[torch.Tensor],
@@ -466,6 +548,11 @@ class PETLES(torch.nn.Module):
             if species is None:
                 raise ValueError("les_thole needs the species")
             ia_all = self.les_thole_ia[species]
+        fw: Optional[torch.Tensor] = None
+        if self.equilibration != "uniform":
+            if species is None:
+                raise ValueError("les_charge_equilibration needs the species")
+            fw = self.fukui_weights(node_features_list, edge_features_list, padding_mask, cutoff_factors, species)
         for s in range(cells.shape[0]):
             idx = _system_atoms(system_indices, s)
             qs = q[idx]
@@ -475,7 +562,13 @@ class PETLES(torch.nn.Module):
                     raise ValueError("total_charge_constraint needs the charges")
                 Q = total_charge[s].to(qs.dtype) / self.charge_unit.to(qs.dtype)
                 shift = shift - Q / qs.shape[0]
-            qs = qs - shift
+            if fw is not None and total_charge is not None:
+                if self.equilibration == "atom_cluster" and _periodic(pbc[s]):
+                    raise ValueError("les_charge_equilibration atom_cluster: periodic structures are not supported")
+                Qs = total_charge[s].to(qs.dtype) / self.charge_unit.to(qs.dtype)
+                qs = self.equilibrate(qs, Qs.reshape(-1), fw[idx], positions[idx])
+            else:
+                qs = qs - shift
             q_all = q_all.index_copy(0, idx, qs)
             pos = positions[idx]
             if _periodic(pbc[s]):
@@ -499,6 +592,38 @@ class PETLES(torch.nn.Module):
             sub = (q_all[:, None, :] * qj * w[:, :, None]).sum((1, 2))
             e = e - 0.5 * 14.399645 * sub  # KE
         return self.les_gate * e
+
+
+def fukui_cluster_projection(q: torch.Tensor, f: torch.Tensor, r: torch.Tensor, pos: torch.Tensor, rc: float,
+                             w: float) -> torch.Tensor:
+    """Per-cluster Fukui equilibration (``atom_cluster``): hard single-link clusters at ``rc``; cluster totals
+    ``Q_a`` moved to the plateau ``P(Q_a) = k + smootherstep((Q_a - k - 1/2) / w + 1/2)``, the residual
+    ``T = r - sum_a (P_a - Q_a)`` routed by ``g_a = F_a (1e-3 + P'(Q_a))``:
+    ``q_i <- q_i + f_i / F_a (P_a - Q_a + T g_a / G)``, so ``sum q = Q`` exactly. q, f (n, C), r (C,)."""
+    n = q.shape[0]
+    with torch.no_grad():
+        A = torch.cdist(pos, pos) < rc
+        lab = torch.arange(n, device=pos.device)
+        for _ in range(n):
+            new = torch.where(A, lab[None, :], n).min(1).values
+            if torch.equal(new, lab):
+                break
+            lab = new
+        _, cl = torch.unique(lab, return_inverse=True)
+    K = int(cl.max()) + 1
+    C = q.shape[1]
+    Q0 = torch.zeros(K, C, dtype=q.dtype, device=q.device).index_add(0, cl, q)
+    F = torch.zeros(K, C, dtype=q.dtype, device=q.device).index_add(0, cl, f)
+    k = torch.floor(Q0.detach())
+    u = (Q0 - k - 0.5) / w + 0.5
+    P = k + _smootherstep(u)
+    uc = torch.clamp(u, 0.0, 1.0)
+    dP = torch.where((u > 0) & (u < 1), 30 * uc * uc * (uc - 1) ** 2, torch.zeros_like(u)) / w
+    s = P - Q0
+    g = F * (1e-3 + dP)
+    T = r - s.sum(0)
+    t = s + T * g / g.sum(0)
+    return q + f / F[cl] * t[cl]
 
 
 def apply_plato_lr(backend: torch.nn.Module, h: dict) -> None:
@@ -560,6 +685,10 @@ def apply_plato_lr(backend: torch.nn.Module, h: dict) -> None:
             float(h.get("les_thole_a", 0.39)),
             [z for z, i in sorted(((z, int(i)) for z, i in enumerate(backend.species_to_species_index.tolist())
                                    if int(i) >= 0), key=lambda t: t[1])],
+            str(h.get("les_charge_equilibration", "uniform")),
+            float(h.get("les_fukui_pm_width", 0.05)),
+            float(h.get("les_fukui_cluster_w", 0.6)),
+            float(h.get("les_fukui_cluster_r", 8.0)),
         )
     elif h.get("total_charge_constraint", False):
         raise ValueError("total_charge_constraint needs les: true")
